@@ -606,11 +606,14 @@ def update_aclgraph_sizes(vllm_config: VllmConfig) -> None:
         resources_per_graph += draft.get_total_num_hidden_layers() + 1
 
     # TODO: Find out whether we need to take into account the pp_size
+    # In edge-cloud mode, use cloud_npu_count (max TP parallelism) instead of
+    # local tensor_parallel_size to ensure consistent calculation on both sides
+    tp_for_comm = parallel_config.cloud_npu_count if parallel_config.enable_edge_cloud else parallel_config.tensor_parallel_size
     num_comm_groups = sum(
         size > 1
         for size in [
             parallel_config.data_parallel_size,
-            parallel_config.tensor_parallel_size,
+            tp_for_comm,
         ]
     )
 

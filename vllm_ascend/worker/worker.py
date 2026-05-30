@@ -292,8 +292,25 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
+        parallel_config = self.parallel_config
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
+        if (
+            parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.data_parallel_size > 1
+        ):
+            # Use local DP rank if available, otherwise use global DP rank.
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
+            # Use local_world_size as the stride per DP instance
+            local_world_size = parallel_config.local_world_size
+            # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
+            self.local_rank += dp_local_rank * local_world_size
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
