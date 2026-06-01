@@ -292,25 +292,8 @@ class NPUWorker(WorkerBase):
         self.cache_config.num_cpu_blocks = num_cpu_blocks
 
     def _init_device(self):
-        parallel_config = self.parallel_config
         device = torch.device(f"npu:{self.local_rank}")
         torch.npu.set_device(device)
-        if (
-            parallel_config.distributed_executor_backend
-            not in ("ray", "external_launcher")
-            and parallel_config.data_parallel_backend != "ray"
-            and parallel_config.data_parallel_size > 1
-        ):
-            # Use local DP rank if available, otherwise use global DP rank.
-            dp_local_rank = parallel_config.data_parallel_rank_local
-            if dp_local_rank is None:
-                dp_local_rank = parallel_config.data_parallel_index
-
-            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
-            # Use local_world_size as the stride per DP instance
-            local_world_size = parallel_config.local_world_size
-            # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
-            self.local_rank += dp_local_rank * local_world_size
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -959,8 +942,29 @@ class NPUWorker(WorkerBase):
     def _init_worker_distributed_environment(self) -> None:
         """Initialize the distributed environment."""
         init_batch_invariance()
+        # NOTE: `self.local_rank` is also consumed by `bind_cpus` for CPU
+        # binding, so it must stay as the original TP local rank. Compute the
+        # adjusted local rank locally and pass it to `init_distributed_environment`.
+        local_rank = self.local_rank
+        parallel_config = self.parallel_config
+        if (
+            parallel_config.distributed_executor_backend
+            not in ("ray", "external_launcher")
+            and parallel_config.data_parallel_backend != "ray"
+            and parallel_config.data_parallel_size > 1
+        ):
+            # Use local DP rank if available, otherwise use global DP rank.
+            dp_local_rank = parallel_config.data_parallel_rank_local
+            if dp_local_rank is None:
+                dp_local_rank = parallel_config.data_parallel_index
+
+            # In edge-cloud mode, local_world_size = edge_npu_count or cloud_npu_count
+            # Use local_world_size as the stride per DP instance
+            local_world_size = parallel_config.local_world_size
+            # DP_LOCAL_RANK * LOCAL_WORLD_SIZE + TP_LOCAL_RANK
+            local_rank += dp_local_rank * local_world_size
         init_distributed_environment(
-            self.parallel_config.world_size, self.rank, self.distributed_init_method, self.local_rank, "hccl"
+            self.parallel_config.world_size, self.rank, self.distributed_init_method, local_rank, "hccl"
         )
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,

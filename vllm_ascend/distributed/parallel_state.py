@@ -321,21 +321,28 @@ def init_ascend_model_parallel(
     if model_parallel_initialized():
         return
     assert torch.distributed.is_initialized()
+    # Declare globals upfront to avoid "used prior to global declaration" errors
     global _MC2
     if parallel_config.enable_edge_cloud:
-        # Edge-cloud mode has a non-uniform rank layout (edge + cloud),
-        # so the standard DP*PP*PCP*TP grid does not apply.
-        # Instead, initialize Ascend-specific groups aligned with the
-        # edge/cloud TP split established in ensure_model_parallel_initialized.
-        world_size = torch.distributed.get_world_size()
+        # In edge-cloud mode, _MC2 is initialized with the same group_ranks as
+        # upstream _EP: all edge workers form one EP group and all cloud
+        # workers form another. Ranks are arranged by dp instance:
+        # instance0_edge, instance0_cloud, instance1_edge, instance1_cloud.
+        # P_TP / DYNAMIC_EPLB / fine-grained TP groups are skipped because
+        # edge-cloud mode does not use the standard uniform rank layout
+        # (DP * PP * PCP * TP).
         backend = torch.distributed.get_backend(get_world_group().device_group)
         edge_npu_count = parallel_config.edge_npu_count
-
-        edge_ranks = list(range(edge_npu_count))
-        cloud_ranks = list(range(edge_npu_count, world_size))
-
+        cloud_npu_count = parallel_config.cloud_npu_count
+        world_size_per_instance = edge_npu_count + cloud_npu_count
+        ep_edge_ranks = []
+        ep_cloud_ranks = []
+        for dp_idx in range(parallel_config.data_parallel_size):
+            base = dp_idx * world_size_per_instance
+            ep_edge_ranks.extend(range(base, base + edge_npu_count))
+            ep_cloud_ranks.extend(range(base + edge_npu_count, base + world_size_per_instance))
         _MC2 = init_model_parallel_group(
-            [edge_ranks, cloud_ranks],
+            [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
             backend,
             group_name="mc2",
