@@ -334,13 +334,23 @@ def init_ascend_model_parallel(
         backend = torch.distributed.get_backend(get_world_group().device_group)
         edge_npu_count = parallel_config.edge_npu_count
         cloud_npu_count = parallel_config.cloud_npu_count
-        world_size_per_instance = edge_npu_count + cloud_npu_count
-        ep_edge_ranks = []
-        ep_cloud_ranks = []
-        for dp_idx in range(parallel_config.data_parallel_size):
-            base = dp_idx * world_size_per_instance
-            ep_edge_ranks.extend(range(base, base + edge_npu_count))
-            ep_cloud_ranks.extend(range(base + edge_npu_count, base + world_size_per_instance))
+        if parallel_config.is_shared_model_edge:
+            # Shared-model edge-cloud topology: the edge has a
+            # single distributed rank (rank 0) and the cloud
+            # occupies ranks 1..1 + N*C.
+            ep_edge_ranks = [0]
+            ep_cloud_ranks = list(
+                range(1,
+                      1 + parallel_config.data_parallel_size * cloud_npu_count))
+        else:
+            world_size_per_instance = edge_npu_count + cloud_npu_count
+            ep_edge_ranks = []
+            ep_cloud_ranks = []
+            for dp_idx in range(parallel_config.data_parallel_size):
+                base = dp_idx * world_size_per_instance
+                ep_edge_ranks.extend(range(base, base + edge_npu_count))
+                ep_cloud_ranks.extend(
+                    range(base + edge_npu_count, base + world_size_per_instance))
         _MC2 = init_model_parallel_group(
             [ep_edge_ranks, ep_cloud_ranks],
             get_world_group().local_rank,
@@ -1030,6 +1040,7 @@ def _apply_sp_chunk_inplace(tensor_dict: dict[str, Any]) -> None:
 def edge_cloud_broadcast_recv(
     num_tokens: int,
     sp_chunk: bool = False,
+    src: int | None = None,
 ) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
@@ -1041,10 +1052,25 @@ def edge_cloud_broadcast_recv(
     This eliminates the inter-node pickle+Gloo metadata exchange, while
     still broadcasting metadata within the local TP group (intra-node)
     so that non-NPU0 TP ranks can allocate tensors.
+    Args:
+        src: optional explicit source rank (in-group index) for the
+            PP receive. When ``None`` (the default), the upstream
+            vLLM
+            :meth:`GroupCoordinator.irecv_tensor_dict` falls back to
+            the implicit "previous PP rank" routing — the original
+            behaviour of this function. Pass an explicit rank when
+            the caller needs to receive from a specific peer (e.g.
+            the shared-model edge worker, where multiple virtual
+            workers share a single distributed rank and each one
+            communicates with a different cloud peer based on
+            ``local_rank``). The parameter is only consulted when
+            the local PP group is the PP pair (i.e. it participates
+            in the PP receive); the singleton-PP TP-broadcast-only
+            branch is unchanged.
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
+    is_pp_npu0 = pp_group.world_size > 1
     ec_meta = _select_edge_cloud_meta_for_recv()
 
     if is_pp_npu0:
@@ -1052,6 +1078,7 @@ def edge_cloud_broadcast_recv(
         # without metadata sync shapes are computed locally
         tensor_dict, comm_handles, comm_postprocess = edge_cloud_irecv_tensor_dict(
             num_tokens=num_tokens,
+            src=src,
         )
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv: PP tensor_dict is None, "

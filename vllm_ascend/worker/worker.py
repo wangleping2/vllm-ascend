@@ -542,9 +542,19 @@ class NPUWorker(WorkerBase):
                     self.model_runner.edge_cloud_cfg.mode != "embedding_only"
                     or not self.model_runner.supports_mm_inputs)
                 merge_payload = get_edge_cloud_tensor_meta().merge_payload
+                # In the shared-model edge-cloud topology the edge
+                # has a single distributed rank at in-group rank 0;
+                # the cloud first-worker of each dp_rank must
+                # receive the head-layer intermediate tensors from
+                # that single edge rank. Pass the explicit
+                # ``src=0`` so the receive is routed to the edge
+                # rather than the implicit "previous PP rank"
+                # (which would not point at the edge for cloud
+                # first-workers past the first one).
                 tensor_dict, comm_handles, comm_postprocess = edge_cloud_broadcast_recv(
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                     sp_chunk=do_sp_chunk and merge_payload,
+                    src=0,
                 )
                 self.model_runner.cloud_prepare_early(scheduler_output)
 
@@ -633,7 +643,16 @@ class NPUWorker(WorkerBase):
                 _gathered = self._all_gather_tensor_dict(output.tensors)
             else:
                 _gathered = output.tensors
-            if get_pp_group().world_size == 2:
+            # In the shared-model edge-cloud topology the cloud
+            # first-worker of each dp_rank is in the shared PP group
+            # with the edge and must send its middle-layer output
+            # back to the edge (in-group rank 0). Other cloud
+            # workers (TP non-first) are in singleton PP groups
+            # and don't communicate with the edge. We use an
+            # explicit ``dst=0`` rather than the default "next PP
+            # rank" routing because the edge sits at in-group rank
+            # 0, not the slot after the cloud.
+            if get_pp_group().world_size > 1:
                 # Cloud segment_c runs through full transformer layers and
                 # almost always with cudagraph / SP / DP padding enabled, so
                 # output.tensors[k].shape[0] >= scheduler_output.total. Slice
@@ -642,6 +661,7 @@ class NPUWorker(WorkerBase):
                 # alone (no metadata wire transfer needed).
                 self._pp_send_work = edge_cloud_isend_tensor_dict(
                     _gathered,
+                    dst=0,
                     num_tokens=scheduler_output.total_num_scheduled_tokens,
                 )
         else:

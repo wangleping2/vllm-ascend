@@ -939,6 +939,110 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
+    def bind_to_shared_model(self, model: nn.Module) -> None:
+        """Bind this runner to a model object loaded by another runner.
+
+        Used by ``SharedModelEdgeWorker`` follower workers to share a single
+        ``nn.Module`` instance across multiple model runners in the same
+        process. Replaces ``self.model`` with ``model`` and mirrors the
+        post-model-creation side effects of :meth:`load_model`:
+
+        - edge-cloud: re-derives ``num_layers`` and re-creates the segment
+          callables from the shared (already sharded) model.
+        - dynamic EPLB: registers the shared model.
+        - drafter: runs the drafter ``load_model`` hook against the shared
+          model and sets the eagle3 aux hidden state layers.
+        - ACLGraphWrapper: wraps the shared model if cudagraph mode is on.
+        - profiler: starts the data dump if cudagraph mode is on.
+
+        The caller is responsible for:
+
+        - ensuring ``model`` has already been fully loaded by another
+          runner in the same process (i.e. the leader
+          ``SharedModelEdgeWorker``);
+        - assigning ``self.model_memory_usage`` after binding, because only
+          the leader's profile run actually measures it.
+        """
+        self.model = model
+
+        # Edge-cloud specific state, derived from the (already sharded) model.
+        if self._edge_cloud_enabled:
+            # Locate the transformer layers — the model may be wrapped in a
+            # multimodal ConditionalGeneration (language_model.model.layers)
+            # or be a plain CausalLM (model.layers).
+            if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+                transformer_layers = self.model.model.layers
+            else:
+                transformer_layers = self.model.language_model.model.layers
+            self.num_layers = len(transformer_layers)
+            if hasattr(self.model, "set_moe_parameters"):
+                self.model.set_moe_parameters()
+            if self.edge_cloud_cfg.role == "edge":
+                self.segment_a = self._create_segment_callable(
+                    self.model,
+                    0,
+                    self.head_k,
+                    is_first_segment=True,
+                    is_last_segment=False,
+                )
+                self.segment_e = self._create_segment_callable(
+                    self.model,
+                    self.num_layers - self.tail_k,
+                    self.num_layers,
+                    is_first_segment=False,
+                    is_last_segment=True,
+                )
+                self.segment_a_wrapper = self._wrap_segment_if_needed(
+                    self.segment_a)
+                self.segment_e_wrapper = self._wrap_segment_if_needed(
+                    self.segment_e)
+            else:
+                self.segment_c = self._create_segment_callable(
+                    self.model,
+                    self.head_k,
+                    self.num_layers - self.tail_k,
+                    is_first_segment=False,
+                    is_last_segment=False,
+                )
+                self.segment_c_wrapper = self._wrap_segment_if_needed(
+                    self.segment_c)
+
+        # Standard post-model-creation side effects.
+        if self.dynamic_eplb:
+            model_register(self.model)
+        if self.drafter:
+            logger.info("Loading drafter model for shared model binding...")
+            if self.vllm_config.quant_config is not None:
+                patch_load_weights(self.vllm_config)
+            with get_tp_context(self.drafter):
+                self.drafter.load_model(self.model)
+            if self.use_aux_hidden_state_outputs:
+                from vllm.model_executor.models.interfaces import supports_eagle3
+                if not supports_eagle3(self.model):
+                    raise RuntimeError(
+                        "Model does not support EAGLE3 interface but "
+                        "aux_hidden_state_outputs was requested"
+                    )
+                aux_layers = self._get_eagle3_aux_layers_from_config()
+                if not aux_layers:
+                    aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
+                self.model.set_aux_hidden_state_layers(aux_layers)
+
+        # wrap the model with full graph wrapper if needed.
+        if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
+            if not isinstance(self.model, ACLGraphWrapper):
+                self.update_stream: torch.npu.Stream = torch.npu.Stream()
+                self.model = ACLGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
+
+        if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+            self._start_dump_data()
+
     def _pad_query_start_loc_for_fia(
         self,
         num_tokens_padded: int,
