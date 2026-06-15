@@ -169,6 +169,7 @@ from vllm_ascend.utils import (
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
 
+from vllm_ascend.worker.edge_cloud.execute_model_bundle import _ExecuteModelBundle
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -2544,6 +2545,574 @@ class NPUModelRunner(GPUModelRunner):
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
         return None
+
+    # ------------------------------------------------------------------
+    # Batched compute path: per-dp_rank ``execute_model_pre``, then one
+    # batched ``execute_model_batched_head`` / ``_tail``, then per-dp_rank
+    # ``execute_model_post_batched``. Driven by
+    # :class:`SharedModelWorkerProc.worker_busy_loop`.
+    # ------------------------------------------------------------------
+    def execute_model_pre(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> _ExecuteModelBundle | ModelRunnerOutput | None:
+        """Per-dp_rank preprocess for the batched compute path.
+
+        Mirrors ``execute_model`` lines 1898-2155 (everything BEFORE
+        ``set_ascend_forward_context``) plus the dynamic_eplb hook
+        (lines 2157-2159). Updates ``self.input_batch``.
+
+        For empty / no-work cases, returns the same early
+        ``ModelRunnerOutput`` / ``None`` values as the original
+        ``execute_model``; the busy_loop detects these via
+        ``handle_output`` and skips the batched forward. Otherwise
+        returns a :class:`_ExecuteModelBundle` consumed by
+        ``execute_model_batched_head`` / ``_tail`` / ``_post_batched``.
+
+        Does NOT call ``set_ascend_forward_context``, ``_model_forward``
+        or ``compute_logits``. Does NOT write ``self.execute_model_state``
+        (that is the job of ``execute_model_post_batched``).
+        """
+        if self.vllm_config.model_config.enable_return_routed_experts:
+            if vllm_version_is("0.20.2"):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.clear_buffer()
+            elif self.routed_experts_initialized:
+                self.routed_experts_capturer.clear_buffer()
+
+        if self.ascend_config.profiling_chunk_config.need_timing:
+            if getattr(scheduler_output, "disable_profiling_timing", False):
+                self.ascend_config.profiling_chunk_config.need_timing = False
+            else:
+                self._sync_device()
+                self._execution_start_time = time.perf_counter()
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called after "
+                "execute_model() returns None.")
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.use_ngram_gpu()
+        ):
+            num_scheduled_tokens_copy = (
+                scheduler_output.num_scheduled_tokens.copy())
+            spec_decode_tokens_copy = (
+                scheduler_output.scheduled_spec_decode_tokens.copy())
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
+
+        self._start_dump_data()
+        if ((
+            self.use_async_scheduling and self.num_spec_tokens
+                and self._draft_token_ids is None
+        ) or (
+            self.pcp_size > 1 and self.supports_mm_inputs
+            and get_pp_group().is_first_rank
+            and not self.model_config.is_encoder_decoder
+        )):
+            scheduler_output = deepcopy(scheduler_output)
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        with record_function_or_nullcontext("prepare input"):
+            with self.synchronize_input_prep():
+                if (
+                    self.use_async_scheduling
+                    and self.num_spec_tokens
+                    and self.input_batch.prev_req_id_to_index is not None
+                ):
+                    for req_id in (
+                            scheduler_output.scheduled_cached_reqs.req_ids):
+                        if (
+                            req_id
+                            not in self.input_batch.prev_req_id_to_index
+                            and (req_state := self.requests.get(req_id))
+                                is not None
+                            and req_state.prev_num_draft_len
+                        ):
+                            req_state.prev_num_draft_len = 0
+
+                deferred_state_corrections_fn = self._update_states(
+                    scheduler_output)
+
+                if has_ec_transfer() and get_ec_transfer().is_producer:
+                    with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                    ) as ec_connector_output:
+                        self._execute_mm_encoder(scheduler_output)
+                        self._finalize_dump_data()
+                    return make_empty_encoder_model_runner_output(
+                        scheduler_output)
+
+                if not num_scheduled_tokens:
+                    if (
+                        self.parallel_config.distributed_executor_backend
+                        == "external_launcher"
+                        and self.parallel_config.data_parallel_size > 1
+                    ):
+                        self._dummy_run(1)
+                    if not has_kv_transfer_group():
+                        return EMPTY_MODEL_RUNNER_OUTPUT
+                    return self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config)
+                if self.cache_config.kv_sharing_fast_prefill:
+                    assert not self.num_prompt_logprobs, (
+                        "--kv-sharing-fast-prefill produces incorrect "
+                        "logprobs for prompt tokens, tokens, please disable "
+                        "it when the requests need prompt logprobs"
+                    )
+
+                num_reqs = self.input_batch.num_reqs
+                req_ids = self.input_batch.req_ids
+                tokens = [scheduler_output.num_scheduled_tokens[i]
+                          for i in req_ids]
+                num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+                max_num_scheduled_tokens = int(
+                    num_scheduled_tokens_np.max())
+
+                (
+                    logits_indices,
+                    spec_decode_metadata,
+                    total_num_scheduled_tokens,
+                    num_scheduled_tokens_compressed_list,
+                ) = self._prepare_inputs(
+                    scheduler_output, num_scheduled_tokens_np,
+                )
+
+                num_tokens_unpadded = (
+                    scheduler_output.total_num_scheduled_tokens)
+                if self.pcp_size > 1:
+                    num_tokens_unpadded = (
+                        self.pcp_manager.total_num_sampled_tokens_pcp)
+                cascade_attn_prefix_lens = None
+                if self.cascade_attn_enabled and (
+                        not self.parallel_config.enable_dbo):
+                    cascade_attn_prefix_lens = (
+                        self._compute_cascade_attn_prefix_lens(
+                            num_scheduled_tokens_np,
+                            self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                            scheduler_output.num_common_prefix_blocks,
+                        ))
+
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    force_eager=self.model_config.enforce_eager,
+                    num_encoder_reqs=len(
+                        scheduler_output.scheduled_encoder_inputs),
+                )
+
+                num_tokens_padded = batch_desc.num_tokens
+                num_reqs_padded = (batch_desc.num_reqs
+                                   if batch_desc.num_reqs is not None
+                                   else num_reqs)
+                ubatch_slices, ubatch_slices_padded = (
+                    maybe_create_ubatch_slices(
+                        should_ubatch,
+                        num_scheduled_tokens_np,
+                        num_tokens_padded,
+                        num_reqs_padded,
+                        self.parallel_config.num_ubatches,
+                    ))
+
+                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
+
+                if self.cache_config.mamba_cache_mode == "align":
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
+                        deferred_state_corrections_fn = None
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs])
+                    self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+                use_spec_decode = (
+                    len(scheduler_output.scheduled_spec_decode_tokens) > 0)
+                ubatch_slices_attn = (ubatch_slices_padded
+                                      if pad_attn else ubatch_slices)
+
+                if (
+                    cudagraph_mode == CUDAGraphMode.FULL
+                    or (enable_sp() and not self.model_config.use_mla)
+                ) and self.pcp_size * self.dcp_size == 1:
+                    num_reqs_padded = self._pad_query_start_loc_for_fia(
+                        num_tokens_padded, num_reqs_padded, num_reqs,
+                        cudagraph_mode, batch_desc.num_reqs,
+                    )
+
+                (
+                    attn_metadata,
+                    spec_decode_common_attn_metadata,
+                ) = self._build_attention_metadata(
+                    num_tokens=(num_tokens_unpadded
+                                if not (self.use_cp
+                                        and self.pcp_manager.pcp_use_hybrid_attn)
+                                else total_num_scheduled_tokens),
+                    num_tokens_padded=num_tokens_padded,
+                    num_reqs=num_reqs,
+                    num_reqs_padded=num_reqs_padded,
+                    max_query_len=max_num_scheduled_tokens,
+                    ubatch_slices=ubatch_slices_attn,
+                    logits_indices=logits_indices,
+                    use_spec_decode=use_spec_decode,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                )
+
+            (
+                input_ids,
+                inputs_embeds,
+                positions,
+                intermediate_tensors,
+                model_kwargs,
+                ec_connector_output,
+            ) = self._preprocess(
+                scheduler_output,
+                num_tokens_padded
+                if not (self.use_cp
+                        and self.pcp_manager.pcp_use_hybrid_attn)
+                else total_num_scheduled_tokens,
+                None,
+            )
+
+            update_cos_sin(positions)
+
+        if self.dynamic_eplb:
+            with record_function_or_nullcontext("EPLB weight D2D"):
+                self.eplb_updator.forward_before()
+
+        return _ExecuteModelBundle(
+            input_ids=input_ids,
+            positions=positions,
+            inputs_embeds=inputs_embeds,
+            intermediate_tensors=None,
+            hidden_states=None,
+            logits_indices=logits_indices,
+            spec_decode_metadata=spec_decode_metadata,
+            spec_decode_common_attn_metadata=spec_decode_common_attn_metadata,
+            scheduler_output=scheduler_output,
+            num_tokens_padded=num_tokens_padded,
+            num_tokens_across_dp=num_tokens_across_dp,
+            cudagraph_mode=cudagraph_mode,
+            batch_desc=batch_desc,
+            attn_metadata=attn_metadata,
+            ec_connector_output=ec_connector_output,
+            cudagraph_stats=cudagraph_stats,
+            deferred_state_corrections_fn=deferred_state_corrections_fn,
+        )
+
+    def execute_model_batched_head(
+        self,
+        bundles: list[_ExecuteModelBundle],
+    ) -> list[IntermediateTensors]:
+        """1 batched head model_forward = 1 ``model.embed_tokens``.
+
+        Called ONCE per round from
+        :class:`SharedModelWorkerProc.worker_busy_loop`. The forward
+        context is set up for the merged batch; ``_model_forward`` runs
+        once on the shared ``nn.Module``; the resulting ``hidden_states``
+        is sliced back to per-dp_rank.
+
+        Returns per-dp_rank ``IntermediateTensors`` slices, padded to
+        ``self.max_num_tokens`` in the ``embedding_only`` mode so that
+        the cloud's pre-allocated buffer is large enough.
+        """
+        dp_size = len(bundles)
+
+        # All bundles in a round come from the same
+        # ``_determine_batch_execution_and_padding`` condition, so
+        # the per-bundle fields that are ``| None`` are either
+        # None for every bundle or non-None for every bundle.
+        # ``torch.cat`` cannot accept None elements, so for each
+        # such field we short-circuit: if any bundle has it as
+        # None, the merged value is None (or an empty-tensor
+        # placeholder for ``input_ids`` / ``positions`` /
+        # ``num_tokens_across_dp``, since the downstream
+        # ``_model_forward`` accepts None for those).
+        if all(b.input_ids is not None for b in bundles):
+            merged_input_ids = torch.cat([b.input_ids for b in bundles])
+        else:
+            merged_input_ids = None
+        if all(b.positions is not None for b in bundles):
+            # ``positions`` is 1D ``[N]`` for plain text models and
+            # 2D ``[mrope_dim, N]`` for mrope / xdrope models
+            # (see ``_preprocess`` upstream). ``torch.cat`` along
+            # the token axis means:
+            #   - 1D: dim=0  (the only dim)
+            #   - 2D: dim=1  (mrope_dim is fixed; token dim is
+            #     the inner axis)
+            # All per-dp_rank ``N`` values differ, so the wrong
+            # dim would error with "Sizes of tensors must match
+            # except in the concatenating dimension".
+            # All per-dp_rank ``positions`` tensors share the
+            # same dimensionality (same model, same
+            # text / mrope / xdrope path) — pick the first
+            # bundle's shape to determine the cat dim.
+            cat_dim = bundles[0].positions.dim() - 1
+            merged_positions = torch.cat(
+                [b.positions for b in bundles], dim=cat_dim)
+        else:
+            merged_positions = None
+        # ``input_ids`` and ``inputs_embeds`` are mutually
+        # exclusive: text path → ``input_ids``, mm path →
+        # ``inputs_embeds``. Forwarding both correctly requires
+        # cat-ing the mm-side tensor when present and letting
+        # ``forward_edge_cloud_segment`` (segment_a) pick the
+        # right one. We pass both; the segment wrapper
+        # internally prefers ``inputs_embeds`` when non-None
+        # (see qwen3_5_edge_cloud.py ``is_first_segment``
+        # branch).
+        if all(b.inputs_embeds is not None for b in bundles):
+            merged_inputs_embeds = torch.cat(
+                [b.inputs_embeds for b in bundles])
+        else:
+            merged_inputs_embeds = None
+        num_tokens_merged = (
+            merged_input_ids.shape[0] if merged_input_ids is not None
+            else (merged_inputs_embeds.shape[0]
+                  if merged_inputs_embeds is not None else 0))
+        num_tokens_padded_merged = sum(b.num_tokens_padded for b in bundles)
+        # The batched head segment runs as a single merged
+        # forward — there is no SP / DP all-gather that
+        # needs the per-dp_rank padded token counts. The
+        # forward-context consumers (MoE comm-method
+        # selector at line 91, post-segment custom ops)
+        # fall back to ``num_tokens`` when
+        # ``num_tokens_across_dp`` is ``None``. The
+        # per-dp_rank vector is also ambiguous in a
+        # partial round (some dp_ranks may not have
+        # produced a batched marker), so we pass ``None``
+        # rather than reconstructing it.
+        num_tokens_across_dp_merged = None
+
+        any_bundle = bundles[0]
+        with (
+            record_function_or_nullcontext("forward"),
+            set_ascend_forward_context(
+                attn_metadata=any_bundle.attn_metadata,
+                vllm_config=self.vllm_config,
+                num_tokens=num_tokens_padded_merged,
+                num_tokens_across_dp=num_tokens_across_dp_merged,
+                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                batch_descriptor=any_bundle.batch_desc,
+                num_actual_tokens=num_tokens_merged,
+                model_instance=self.model,
+                max_tokens_across_pcp=(0 if self.pcp_size == 1
+                                       else self.pcp_manager.max_num_tokens_across_pcp),
+                skip_compiled=False,
+            ),
+        ):
+            hidden_states = self._model_forward(
+                num_tokens_padded_merged,
+                merged_input_ids,
+                merged_positions,
+                None,
+                merged_inputs_embeds,
+            )
+
+        token_offsets = [0]
+        for b in bundles:
+            # ``input_ids`` and ``inputs_embeds`` are mutually
+            # exclusive: text path → ``input_ids``,
+            # mm path → ``inputs_embeds``. Use whichever is
+            # present for the per-dp_rank slice shape.
+            shape_src = b.input_ids if b.input_ids is not None else b.inputs_embeds
+            token_offsets.append(token_offsets[-1] + shape_src.shape[0])
+        results: list[IntermediateTensors] = []
+        # Edge head segment's ``_model_forward`` returns an
+        # ``IntermediateTensors`` (carrying ``hidden_states`` and
+        # ``residual``) because ``is_last_segment=False``. We
+        # slice per-field instead of relying on
+        # ``IntermediateTensors.__getitem__`` which only
+        # supports ``str`` / ``slice`` keys, not int indexing.
+        head_hidden = hidden_states["hidden_states"]
+        head_residual = hidden_states["residual"]
+        for i, b in enumerate(bundles):
+            slice_hs = head_hidden[token_offsets[i]:token_offsets[i + 1]]
+            slice_res = head_residual[token_offsets[i]:token_offsets[i + 1]]
+            if (self.edge_cloud_cfg.mode == "embedding_only"
+                    and slice_hs.shape[0] < self.max_num_tokens):
+                pad = torch.zeros(
+                    self.max_num_tokens - slice_hs.shape[0],
+                    *slice_hs.shape[1:],
+                    dtype=slice_hs.dtype,
+                    device=slice_hs.device,
+                )
+                slice_hs = torch.cat([slice_hs, pad], dim=0)
+                slice_res = torch.cat([slice_res, pad], dim=0)
+            results.append(
+                IntermediateTensors({
+                    "hidden_states": slice_hs,
+                    "residual": slice_res,
+                }))
+        return results
+
+    def execute_model_batched_tail(
+        self,
+        bundles: list[_ExecuteModelBundle],
+        intermediates: list[IntermediateTensors],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
+        """1 batched tail model_forward + 1 batched ``compute_logits``.
+
+        Called ONCE per round on the leader runner
+        (``self.worker[0].model_runner``) to avoid duplicated forward
+        across dp_ranks. Returns a 4-tuple of:
+
+        * ``merged_hidden_states`` — the full [merged_num_tokens]
+          hidden_states from the batched tail ``_model_forward`` (not
+          indexed by ``logits_indices``). The caller slices this per
+          dp_rank to populate
+          :attr:`ExecuteModelState.hidden_states`.
+        * ``merged_sample_hidden_states`` — ``hidden_states`` indexed
+          by ``logits_indices`` (per-sample rows). The caller slices
+          this per dp_rank to populate
+          :attr:`ExecuteModelState.sample_hidden_states`.
+        * ``merged_logits`` — the per-sample logits from
+          ``compute_logits``. The caller slices this per dp_rank to
+          populate :attr:`ExecuteModelState.logits`.
+        * ``kv_connector_output`` — the captured kv-connector output
+          (shared across dp_ranks; the tail forward is the same
+          for every dp_rank).
+        """
+        dp_size = len(bundles)
+
+        # Per-dp_rank head slices come from
+        # ``execute_model_batched_head``; both fields are
+        # populated by the patched Qwen3.5 segment. Defensive
+        # short-circuit: if a per-dp_rank slice is ``None`` for
+        # either field, the merged value is ``None`` and the
+        # corresponding ``IntermediateTensors`` entry is
+        # ``None`` — handled by the downstream ``_model_forward``
+        # (which already accepts ``intermediate_tensors=None``
+        # in the head-segment path).
+        if all(it["hidden_states"] is not None for it in intermediates):
+            merged_hidden = torch.cat(
+                [it["hidden_states"] for it in intermediates])
+        else:
+            merged_hidden = None
+        if all(it["residual"] is not None for it in intermediates):
+            merged_residual = torch.cat(
+                [it["residual"] for it in intermediates])
+        else:
+            merged_residual = None
+        merged_intermediate = IntermediateTensors({
+            "hidden_states": merged_hidden,
+            "residual": merged_residual,
+        })
+
+        token_offsets = [0]
+        for it in intermediates:
+            if it["hidden_states"] is None:
+                token_offsets.append(token_offsets[-1])
+            else:
+                token_offsets.append(token_offsets[-1]
+                                     + it["hidden_states"].shape[0])
+        merged_logits_indices = torch.cat(
+            [bundles[i].logits_indices + token_offsets[i]
+             for i in range(dp_size)])
+
+        any_bundle = bundles[0]
+        kv_connector_output = None
+        with (
+            record_function_or_nullcontext("forward"),
+            set_ascend_forward_context(
+                attn_metadata=any_bundle.attn_metadata,
+                vllm_config=self.vllm_config,
+                num_tokens=any_bundle.num_tokens_padded,
+                num_tokens_across_dp=any_bundle.num_tokens_across_dp,
+                aclgraph_runtime_mode=any_bundle.cudagraph_mode,
+                batch_descriptor=any_bundle.batch_desc,
+                num_actual_tokens=(merged_hidden.shape[0]
+                                   if merged_hidden is not None else 0),
+                model_instance=self.model,
+                max_tokens_across_pcp=(0 if self.pcp_size == 1
+                                       else self.pcp_manager.max_num_tokens_across_pcp),
+                skip_compiled=False,
+            ),
+            self.maybe_get_kv_connector_output(
+                any_bundle.scheduler_output,
+                **{"defer_finalize": True},
+            ) as kv_connector_output,
+        ):
+            hidden_states = self._model_forward(
+                any_bundle.num_tokens_padded,
+                any_bundle.input_ids,
+                any_bundle.positions,
+                merged_intermediate,
+                any_bundle.inputs_embeds,
+            )
+
+        merged_sample_hidden_states = hidden_states[merged_logits_indices]
+        merged_logits = self.model.compute_logits(
+            merged_sample_hidden_states)
+
+        return (hidden_states, merged_sample_hidden_states, merged_logits,
+                kv_connector_output)
+
+    def execute_model_post_batched(
+        self,
+        bundle: _ExecuteModelBundle,
+        sample_hidden_states_k: torch.Tensor,
+        logits_k: torch.Tensor,
+        hidden_states_k: torch.Tensor,
+        kv_connector_output: Any,
+    ) -> None:
+        """Per-dp_rank state writing after batched ``compute_logits``.
+
+        Mirrors the tail portion of ``execute_model`` (lines 2295-2314):
+        writes ``self.execute_model_state`` and
+        ``self.kv_connector_output`` and triggers the deferred state
+        corrections from ``_update_states``.
+
+        Strictly does NOT include any ``sample_tokens`` logic:
+        no ``apply_grammar_bitmask``, no ``_sample``, no
+        ``_bookkeeping_sync``, no ``propose_draft_token_ids``,
+        no ``ModelRunnerOutput`` return. It also does NOT call
+        ``set_ascend_forward_context`` / ``_model_forward`` /
+        ``compute_logits`` (those live in ``execute_model_batched_tail``).
+        """
+        self.execute_model_state = ExecuteModelState(
+            scheduler_output=bundle.scheduler_output,
+            logits=logits_k,
+            spec_decode_metadata=bundle.spec_decode_metadata,
+            spec_decode_common_attn_metadata=(
+                bundle.spec_decode_common_attn_metadata),
+            hidden_states=hidden_states_k,
+            sample_hidden_states=sample_hidden_states_k,
+            aux_hidden_states=None,
+            attn_metadata=bundle.attn_metadata,
+            positions=bundle.positions,
+            ec_connector_output=bundle.ec_connector_output,
+            cudagraph_stats=bundle.cudagraph_stats,
+            batch_desc=bundle.batch_desc,
+        )
+        self.kv_connector_output = kv_connector_output
+        if bundle.deferred_state_corrections_fn:
+            bundle.deferred_state_corrections_fn()
 
     @torch.inference_mode()
     def sample_tokens(

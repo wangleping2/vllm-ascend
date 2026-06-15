@@ -46,19 +46,18 @@ the shared PP group).
 
 from __future__ import annotations
 
+import traceback
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import logger
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     ModelRunnerOutput,
 )
-
-
+from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
 
 from vllm_ascend.distributed.parallel_state import (
     edge_cloud_broadcast_recv,
@@ -66,6 +65,9 @@ from vllm_ascend.distributed.parallel_state import (
     get_edge_cloud_tensor_meta,
     init_ascend_model_parallel,
     init_edge_cloud_tensor_meta,
+)
+from vllm_ascend.worker.edge_cloud.execute_model_bundle import (
+    _ExecuteModelBundle,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.worker import NPUWorker, _detect_has_residual
@@ -157,6 +159,298 @@ class DeferredExecutePostprocess(AsyncModelRunnerOutput):
         if isinstance(result, AsyncModelRunnerOutput):
             result = result.get_output()
         return result
+
+class _BatchedExecuteMarker(DeferredExecutePostprocess):
+    """Marker returned by :meth:`SharedModelEdgeWorker.execute_model_batched_pre`
+    carrying the per-dp_rank :class:`_ExecuteModelBundle` produced by
+    ``NPUModelRunner.execute_model_pre``, plus a back-reference to the
+    :class:`SharedModelEdgeWorker` that produced it.
+
+    The shared model ``worker_busy_loop`` intercepts this via
+    ``isinstance(output, _BatchedExecuteMarker)`` in ``_dispatch``,
+    stores ``output.bundle`` in ``self._round_bundles[k]`` and at the
+    round barrier invokes the marker:
+
+    * :meth:`drive_batched_round` (member function) — per-dp_rank
+      phase of the round: install this dp_rank's PP isend + recv
+      closure into ``pending_deferred``. The dp_rank comes from
+      ``self.worker.local_rank`` (the worker the marker was produced
+      on). The batched head itself is run once via
+      :meth:`run_batched_head` (class function), which is dp_rank /
+      ``self``-agnostic.
+    * :meth:`drain_batched_round` (class function) — Phase B/C: collect
+      per-dp_rank intermediates from the recv closures, run 1× batched
+      tail forward + 1× ``compute_logits`` on the leader runner, slice
+      the merged sample hidden states / logits back to per-dp_rank and
+      call :meth:`NPUModelRunner.execute_model_post_batched` on each
+      worker's model_runner. Then per-dp_rank ``on_dp_rank_output(k, None)``
+      is invoked to signal the engine that ``sample_tokens`` can run.
+
+    The round state (``_round_bundles`` / ``_round_intermediates`` /
+    ``pending_deferred``) is passed in as parameters — it is **owned
+    by** the upstream ``SharedModelWorkerProc`` so the busy_loop can
+    manage its lifetime alongside the rest of the round barrier.
+    """
+
+    # Class-level cache of the per-dp_rank head slices produced by
+    # ``execute_model_batched_head``; consumed by every marker's
+    # per-dp_rank PP isend during a single round. Cleared by
+    # :meth:`drain_batched_round` at end of round. Keyed by
+    # ``dp_rank`` (not by position in ``batched_dp_ranks``) so
+    # that a partial round (e.g. ``batched_dp_ranks = [1, 3]``)
+    # still resolves ``per_dp_hidden[1]`` / ``per_dp_hidden[3]``
+    # without confusing a position index with the dp_rank
+    # value.
+    _per_dp_hidden: dict[int, Any] | None = None
+
+    __slots__ = ("bundle", "worker")
+
+    def __init__(
+        self,
+        bundle: "_ExecuteModelBundle",
+        worker: "SharedModelEdgeWorker",
+    ) -> None:
+        self.bundle = bundle
+        self.worker = worker
+        # The real work is driven by the busy_loop via
+        # ``run_batched_head`` (class function, runs once per round
+        # for the batched head) and ``drive_batched_round`` (member
+        # function, runs once per marker for the per-dp_rank
+        # isend + recv closure). The default ``__call__`` path is a
+        # no-op (the marker is not callable in the deferred-tail
+        # sense).
+        super().__init__(postprocess=lambda: None)
+
+    # ------------------------------------------------------------------
+    # Phase A — batched head (1× per round, dp_rank / self-agnostic)
+    # ------------------------------------------------------------------
+    @classmethod
+    def run_batched_head(
+        cls,
+        batched_dp_ranks: list[int],
+        round_bundles: dict[int, "_ExecuteModelBundle"],
+    ) -> dict[int, Any]:
+        """Run the 1× batched head forward on the leader runner.
+
+        dp_rank- and ``self``-agnostic: takes the ordered list of
+        dp_ranks participating in this batched forward plus the
+        per-dp_rank bundle dict, and returns a list of per-dp_rank
+        hidden slices indexed in the same ``batched_dp_ranks`` order
+        (so ``result[i]`` corresponds to ``batched_dp_ranks[i]``).
+        Called once per round by the busy_loop (the first marker of
+        the round).
+
+        ``batched_dp_ranks`` may be a strict subset of
+        ``{0..dp_size-1}`` when some dp_ranks did not produce a
+        batched marker in this round (e.g. empty
+        ``execute_model`` / ``execute_dummy_batch``); those dp_ranks
+        are not merged into the head and have no
+        ``_per_dp_hidden`` entry — they are not handled by the
+        batched path at all.
+        """
+        leader = next(
+            (w for w in _SHARED_MODEL_REGISTRY
+             if getattr(w, "_is_leader", False)), None)
+        assert leader is not None, (
+            "SharedModelEdgeWorker: no leader worker found in "
+            "_SHARED_MODEL_REGISTRY when running batched head")
+        leader_runner = leader.model_runner
+        # Iterate ``batched_dp_ranks`` in caller-supplied order to
+        # keep the merged tensor layout deterministic and
+        # independent of the full ``{0..dp_size-1}`` range.
+        bundles = [round_bundles[k] for k in batched_dp_ranks]
+        per_dp_hidden_list = leader_runner.execute_model_batched_head(
+            bundles)
+        # Key the per-dp_rank hidden slices by dp_rank rather
+        # than by their position in ``batched_dp_ranks``: this
+        # lets ``drive_batched_round`` resolve
+        # ``per_dp_hidden[dp_rank]`` directly (where ``dp_rank``
+        # is the worker's ``local_rank``) regardless of
+        # whether ``batched_dp_ranks`` is a strict subset of
+        # ``{0..dp_size-1}``.
+        cls._per_dp_hidden = dict(zip(batched_dp_ranks,
+                                       per_dp_hidden_list))
+        return cls._per_dp_hidden
+
+    # ------------------------------------------------------------------
+    # Phase A — per-dp_rank PP isend + recv closure
+    # ------------------------------------------------------------------
+    def drive_batched_round(
+        self,
+        pending_deferred: dict[int, Any],
+    ) -> None:
+        """Per-dp_rank phase A: install this dp_rank's PP isend + recv
+        closure into ``pending_deferred``.
+
+        dp_rank comes from ``self.worker.local_rank`` (the worker the
+        marker was produced on). Called once per marker by the
+        busy_loop after :meth:`run_batched_head` has populated
+        :attr:`_per_dp_hidden`.
+        """
+        per_dp_hidden = _BatchedExecuteMarker._per_dp_hidden
+        assert per_dp_hidden is not None, (
+            "_BatchedExecuteMarker.drive_batched_round called before "
+            "run_batched_head populated _per_dp_hidden")
+        # ``_per_dp_hidden`` is keyed by dp_rank (not by position
+        # in ``batched_dp_ranks``), so the per-dp_rank slice for
+        # this marker is a direct lookup with the marker's own
+        # dp_rank.
+        dp_rank = self.worker.local_rank
+        hidden_k = per_dp_hidden[dp_rank]
+        # Edge-cloud with heterogeneous SP: aggregate SP shards to full
+        # sequence before cross-PP send so cloud can re-chunk by its SP.
+        if enable_sp() and (self.worker.model_runner.edge_cloud_cfg.mode != "embedding_only"
+            or not self.worker.model_runner.supports_mm_inputs):
+            _gathered = self.worker._all_gather_tensor_dict(hidden_k.tensors)
+        else:
+            _gathered = hidden_k.tensors
+        # Mirror ``execute_model``: use the edge-cloud-optimised isend
+        # with explicit ``dst`` and ``num_tokens`` slicing so the
+        # receiver can allocate buffers based on
+        # ``SchedulerOutput.total_num_scheduled_tokens`` alone (no
+        # metadata wire transfer).
+        num_tokens = self.bundle.scheduler_output.total_num_scheduled_tokens
+        self.worker._pp_send_work = edge_cloud_isend_tensor_dict(
+            _gathered,
+            dst=dp_rank + 1,
+            num_tokens=num_tokens,
+        )
+        edge_sp = enable_sp()
+        edge_merge = get_edge_cloud_tensor_meta().merge_payload
+        pending_deferred[dp_rank] = (
+            self.worker.make_batched_recv_closure(
+                src=dp_rank + 1,
+                num_tokens=num_tokens,
+                sp_chunk=edge_sp and edge_merge))
+
+    # ------------------------------------------------------------------
+    # Phase B/C: 1× batched tail + per-dp_rank post_batched + handle_output
+    # ------------------------------------------------------------------
+    @classmethod
+    def drain_batched_round(
+        cls,
+        round_bundles: dict[int, "_ExecuteModelBundle"],
+        round_intermediates: dict[int, Any],
+        pending_deferred: dict[int, Any],
+        on_dp_rank_output,
+    ) -> None:
+        """Phase B/C of the batched round, driven once at the end of
+        the round.
+
+        ``on_dp_rank_output`` is a ``(dp_rank, output) -> None``
+        callback the busy_loop supplies to do the response-MQ write
+        (i.e. ``worker_proc.handle_output``). This keeps the marker
+        free of any upstream handle while still letting it route
+        per-dp_rank results.
+
+        For each dp_rank the recv closure in ``pending_deferred`` is
+        invoked to fetch the cloud's middle output, then a single
+        batched tail ``_model_forward`` + ``compute_logits`` runs on
+        the leader runner. The merged sample hidden states / logits
+        are sliced back to per-dp_rank and
+        :meth:`NPUModelRunner.execute_model_post_batched` is called
+        on each worker's model_runner. Finally
+        ``on_dp_rank_output(k, None)`` is invoked for each dp_rank so
+        the engine knows to dispatch the independent
+        ``sample_tokens`` RPC.
+
+        At end-of-round the class-level cache is cleared so the next
+        round can run a fresh batched head.
+        """
+        # 1. Drain per-dp_rank recv closures. Failures on a single
+        #    dp_rank are routed via the callback as FAILURE
+        #    responses, matching the upstream busy_loop convention.
+        for dp_rank, deferred in list(pending_deferred.items()):
+            try:
+                if callable(deferred):
+                    intermediate_k = deferred()
+                else:
+                    intermediate_k = deferred
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception(
+                    "SharedModelWorkerProc hit an exception running "
+                    "batched recv on dp_rank=%d.", dp_rank)
+                on_dp_rank_output(dp_rank, e)
+                # Don't keep the dp_rank in the round; the rest of
+                # the round only batch-processes the surviving
+                # dp_ranks.
+                round_bundles.pop(dp_rank, None)
+                continue
+            round_intermediates[dp_rank] = intermediate_k
+
+        pending_deferred.clear()
+
+        # 2. 1× batched tail on the leader runner — only if at
+        #    least one dp_rank survived the recv.
+        ok_dp_ranks = sorted(round_intermediates.keys())
+        if ok_dp_ranks:
+            leader = next(
+                (w for w in _SHARED_MODEL_REGISTRY
+                 if getattr(w, "_is_leader", False)), None)
+            assert leader is not None, (
+                "SharedModelEdgeWorker: no leader worker found in "
+                "_SHARED_MODEL_REGISTRY when draining batched tail")
+            leader_runner = leader.model_runner
+            bundles = [round_bundles[k] for k in ok_dp_ranks]
+            intermediates = [round_intermediates[k] for k in ok_dp_ranks]
+            try:
+                (merged_hidden, merged_sample_hidden, merged_logits,
+                 kv_connector_output) = (
+                    leader_runner.execute_model_batched_tail(
+                        bundles, intermediates))
+
+                # 3. Slice merged tensors back to per-dp_rank and
+                #    run per-dp_rank post_batched. The slice
+                #    indices follow the order of ``bundles``
+                #    (== ``ok_dp_ranks``) and match the token
+                #    offsets used in ``execute_model_batched_tail``
+                #    (i.e. one slice per ``intermediates[i]``'s
+                #    num_tokens — NOT per ``logits_indices``).
+                token_offsets = [0]
+                for it in intermediates:
+                    token_offsets.append(
+                        token_offsets[-1] + it["hidden_states"].shape[0])
+                logits_offsets = [0]
+                for b in bundles:
+                    logits_offsets.append(
+                        logits_offsets[-1] + b.logits_indices.shape[0])
+                # peer-workers (per-dp_rank) are reached via the
+                # registry, indexed by local_rank == dp_rank.
+                for i, k in enumerate(ok_dp_ranks):
+                    hidden_k = merged_hidden[
+                        token_offsets[i]:token_offsets[i + 1]]
+                    sample_hs_k = merged_sample_hidden[
+                        logits_offsets[i]:logits_offsets[i + 1]]
+                    logits_k = merged_logits[
+                        logits_offsets[i]:logits_offsets[i + 1]]
+                    peer_worker = _SHARED_MODEL_REGISTRY[k]
+                    peer_worker.model_runner.execute_model_post_batched(
+                        bundles[i], sample_hs_k, logits_k,
+                        hidden_k, kv_connector_output)
+            except Exception as e:
+                if hasattr(e, "add_note"):
+                    e.add_note(traceback.format_exc())
+                logger.exception(
+                    "SharedModelWorkerProc hit an exception running "
+                    "batched tail on leader_runner.")
+                # Surface the failure to every surviving dp_rank so
+                # the engine sees a FAILURE response on every MQ.
+                for k in ok_dp_ranks:
+                    on_dp_rank_output(k, e)
+                ok_dp_ranks = []
+
+        # 4. Notify the engine that this dp_rank's batched
+        #    ``execute_model`` completed; the engine then issues
+        #    the independent ``sample_tokens`` RPC.
+        for k in ok_dp_ranks:
+            on_dp_rank_output(k, None)
+
+        # 5. Cleanup round state. The next round starts fresh.
+        _BatchedExecuteMarker._per_dp_hidden = None
+        round_bundles.clear()
+        round_intermediates.clear()
 
 
 class SharedModelEdgeWorker(NPUWorker):
@@ -361,7 +655,6 @@ class SharedModelEdgeWorker(NPUWorker):
         """
         from types import NoneType
         from vllm.sequence import IntermediateTensors
-        from vllm.v1.worker.gpu_worker import AsyncIntermediateTensors
         from vllm_ascend import envs as envs_ascend
 
         # enable msMonitor to monitor the performance of vllm-ascend
@@ -451,6 +744,97 @@ class SharedModelEdgeWorker(NPUWorker):
             return tail_output
 
         return DeferredExecutePostprocess(postprocess=_tail_postprocess)
+
+    # ------------------------------------------------- batched path entry
+    def execute_model_batched_pre(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> "_BatchedExecuteMarker | ModelRunnerOutput | None":
+        """Per-dp_rank preprocess entry for the batched compute path.
+
+        This is a NEW interface added next to the existing
+        :meth:`execute_model` (which is kept unchanged for
+        backward-compat with ``MultiprocExecutor`` and non-batched
+        callers). The shared model ``worker_busy_loop`` routes
+        ``execute_model`` RPCs here for batched rounds; the original
+        head + send path is **not** taken.
+
+        Behaviour:
+        - Drain any in-flight ``_pp_send_work`` and step the profiler.
+        - Call :meth:`NPUModelRunner.execute_model_pre` to update
+          ``self.input_batch`` and obtain an
+          :class:`_ExecuteModelBundle`.
+        - For empty / no-work cases ``execute_model_pre`` returns
+          ``EMPTY_MODEL_RUNNER_OUTPUT`` / ``None`` directly (mirroring
+          the original ``execute_model`` early returns); the
+          ``worker_busy_loop`` routes these through ``handle_output``.
+        - Otherwise return a :class:`_BatchedExecuteMarker` carrying the
+          bundle; the busy_loop intercepts it and orchestrates the
+          batched head / tail / per-dp_rank post via
+          ``NPUModelRunner.execute_model_batched_head`` /
+          ``_tail`` / ``_post_batched``.
+        """
+        from vllm_ascend import envs as envs_ascend
+
+        if envs_ascend.MSMONITOR_USE_DAEMON:
+            from vllm_ascend.profiler.torch_npu_profiler import (
+                dynamic_profile as dp,
+            )
+            dp.step()
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+        if self.profiler is not None:
+            self.profiler.step()
+
+        result = self.model_runner.execute_model_pre(scheduler_output)
+        if isinstance(result, _ExecuteModelBundle):
+            return _BatchedExecuteMarker(bundle=result, worker=self)
+        # ``execute_model_pre`` may short-circuit on the no-work paths
+        # (EC transfer producer, empty scheduler, ...) and return
+        # ``EMPTY_MODEL_RUNNER_OUTPUT`` / ``None`` directly; pass it
+        # through unchanged so the busy_loop routes it via
+        # ``handle_output``.
+        return result
+
+    def make_batched_recv_closure(
+        self,
+        src: int,
+        num_tokens: int,
+        sp_chunk: bool,
+    ):
+        """Return a no-arg closure that receives the cloud middle
+        output for the batched compute path.
+
+        The closure is created here (in vllm_ascend) and stored by
+        the busy_loop in ``_pending_deferred``; the upstream busy_loop
+        does not import vllm_ascend and just calls the closure like
+        any other deferred marker.
+
+        ``src`` is the in-group rank of the cloud first-worker for
+        this dp_rank (``local_rank + 1`` on the shared PP group).
+        ``num_tokens`` / ``sp_chunk`` mirror the recv call in
+        :meth:`SharedModelEdgeWorker.execute_model`'s
+        ``_tail_postprocess``. The closure stores the received
+        ``comm_postprocess`` handles on the returned
+        ``AsyncIntermediateTensors``; the batched tail call in the
+        busy_loop awaits them via ``AsyncIntermediateTensors``
+        (mirrors the original ``DeferredExecutePostprocess``
+        semantics).
+        """
+        def _recv():
+            tensor_dict, comm_handles, comm_postprocess = (
+                edge_cloud_broadcast_recv(
+                    num_tokens=num_tokens,
+                    sp_chunk=sp_chunk,
+                    src=src))
+            return AsyncIntermediateTensors(
+                tensor_dict,
+                comm_handles=comm_handles,
+                comm_postprocess=comm_postprocess,
+            )
+        return _recv
 
     # ------------------------------------------- memory / compile / warmup
     @torch.inference_mode()
