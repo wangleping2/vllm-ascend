@@ -259,8 +259,14 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
         # keep the merged tensor layout deterministic and
         # independent of the full ``{0..dp_size-1}`` range.
         bundles = [round_bundles[k] for k in batched_dp_ranks]
+        # The leader runner handles the merged attn_metadata
+        # construction internally in the non-embedding_only path
+        # (re-using ``self._get_or_build_merged_attn_ctx``), so
+        # the worker only needs to forward ``batched_dp_ranks``.
         per_dp_hidden_list = leader_runner.execute_model_batched_head(
-            bundles)
+            bundles,
+            batched_dp_ranks=batched_dp_ranks,
+        )
         # Key the per-dp_rank hidden slices by dp_rank rather
         # than by their position in ``batched_dp_ranks``: this
         # lets ``drive_batched_round`` resolve
@@ -395,23 +401,42 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
             leader_runner = leader.model_runner
             bundles = [round_bundles[k] for k in ok_dp_ranks]
             intermediates = [round_intermediates[k] for k in ok_dp_ranks]
+            # The leader runner handles the merged attn_metadata
+            # construction internally (re-using the cached
+            # ``self._get_or_build_merged_attn_ctx`` from the head
+            # segment), so the worker only forwards
+            # ``batched_dp_ranks``.
             try:
                 (merged_hidden, merged_sample_hidden, merged_logits,
                  kv_connector_output) = (
                     leader_runner.execute_model_batched_tail(
-                        bundles, intermediates))
+                        bundles, intermediates,
+                        batched_dp_ranks=ok_dp_ranks))
 
                 # 3. Slice merged tensors back to per-dp_rank and
                 #    run per-dp_rank post_batched. The slice
                 #    indices follow the order of ``bundles``
                 #    (== ``ok_dp_ranks``) and match the token
                 #    offsets used in ``execute_model_batched_tail``
-                #    (i.e. one slice per ``intermediates[i]``'s
-                #    num_tokens — NOT per ``logits_indices``).
+                #    (one slice per ``bundles[i]``'s actual
+                # token count — NOT per ``logits_indices``).
+                # Use the per-bundle actual token count (from
+                # the bundle's attn metadata) as the source of
+                # truth, NOT ``intermediates[i]['hidden_states']
+                # .shape[0]`` (which may not reflect the actual
+                # count after the cloud cudagraph pass).
+                def _per_bundle_actual(b) -> int:
+                    md = b.attn_metadata
+                    if isinstance(md, list) and md:
+                        md = md[0][next(iter(md[0]))]
+                    else:
+                        md = next(iter(md.values()))
+                    return md.num_actual_tokens
+
                 token_offsets = [0]
-                for it in intermediates:
+                for b in bundles:
                     token_offsets.append(
-                        token_offsets[-1] + it["hidden_states"].shape[0])
+                        token_offsets[-1] + _per_bundle_actual(b))
                 logits_offsets = [0]
                 for b in bundles:
                     logits_offsets.append(
@@ -449,6 +474,13 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
 
         # 5. Cleanup round state. The next round starts fresh.
         _BatchedExecuteMarker._per_dp_hidden = None
+        # Drop the merged-attn-ctx cache held by the leader runner so
+        # the next round rebuilds it from the new bundles.
+        leader_worker = next(
+            (w for w in _SHARED_MODEL_REGISTRY
+             if getattr(w, "_is_leader", False)), None)
+        if leader_worker is not None:
+            leader_worker.model_runner._merged_attn_ctx_cache = None
         round_bundles.clear()
         round_intermediates.clear()
 
@@ -460,6 +492,33 @@ class SharedModelEdgeWorker(NPUWorker):
     same RPC contract as :class:`NPUWorker` so that the existing
     :class:`MultiprocExecutor` can drive it through ``collective_rpc``
     without changes.
+
+    KV cache global remap (non-embedding_only)
+    ------------------------------------------
+    When the edge runs in ``head_tail`` mode (i.e. not ``embedding_only``),
+    every dp_rank worker gets a per-dp_rank ``KVCacheConfig`` whose
+    ``num_blocks`` reflects only that dp_rank's share of the global
+    pool. To allow a single batched forward to address the union of all
+    dp_rank KV blocks (one global buffer):
+
+    1. Each worker's ``NPUModelRunner.initialize_kv_cache`` registers
+       its ``KVCacheConfig`` in the class-level
+       :attr:`NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[dp_rank]`.
+    2. The LAST worker to enter ``initialize_kv_cache`` detects
+       ``len(...) == data_parallel_size`` and invokes
+       :meth:`allocate_global_kv_cache_tensors` once to build a global
+       KV buffer of size ``sum(num_blocks_per_dp)``.
+    3. The buffer is then shared across all registered workers via a
+       shared ``self.kv_caches`` reference, and the forward context is
+       bound exactly once (avoids duplicated work).
+
+    The "last caller" is whichever dp_rank worker happens to be the
+    final one to register; it does NOT have to be the leader.
+
+    Note: the sync state lives on ``NPUModelRunner`` (not on
+    ``SharedModelEdgeWorker``) because it conceptually belongs to the
+    model runner — the worker class doesn't need to know about
+    ``KVCacheConfig`` or the construction protocol.
     """
 
     # ------------------------------------------------------------------ init
@@ -951,3 +1010,42 @@ class SharedModelEdgeWorker(NPUWorker):
         if not self._is_leader:
             return
         super().uninstall_static_kernel()
+
+    def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        from vllm.distributed.kv_transfer import ensure_kv_transfer_initialized
+        from vllm_ascend.device_allocator.camem import CaMemAllocator
+        """Allocate NPU KV cache with the specified kv_cache_config."""
+        ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        if self.vllm_config.model_config.enable_sleep_mode:
+            allocator = CaMemAllocator.get_instance()
+            context = allocator.use_memory_pool(tag="kv_cache")
+        else:
+            from contextlib import nullcontext
+
+            context = nullcontext()  # type: ignore
+        # Register this virtual worker's ``KVCacheConfig`` under
+        # ``self.local_rank`` BEFORE the runner inspects the registry.
+        # ``self.local_rank`` (the unique virtual worker identifier in
+        # the shared-model edge topology) is the correct key here —
+        # ``self.parallel_config.data_parallel_rank`` is identical
+        # for every virtual worker on the edge (they all share one
+        # NPU and one distributed rank), so it would alias every
+        # dp_rank's entry.
+        NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[self.local_rank] = (
+            kv_cache_config
+        )
+        with context:
+            self.model_runner.initialize_kv_cache(kv_cache_config)
+            if NPUModelRunner._KV_CACHE_CONSTRUCTED:
+                for w in _SHARED_MODEL_REGISTRY:
+                    # Mirror shared last-caller state onto every
+                    # follower's model_runner. Followers will use
+                    # these for batched forward (slot_mapping /
+                    # block_tables need per_dp_offsets; attn_groups
+                    # is required for ``use_hybrid_blocks`` etc.).
+                    w.model_runner._per_dp_offsets = self.model_runner._per_dp_offsets
+                    w.model_runner._per_dp_num_blocks = self.model_runner._per_dp_num_blocks
+                    w.model_runner._global_num_blocks = self.model_runner._global_num_blocks
+                    w.model_runner.kv_caches = self.model_runner.kv_caches
+                    w.model_runner.hybrid_with_attn_and_mamba = self.model_runner.hybrid_with_attn_and_mamba
+                    w.model_runner.initialize_kv_cache_post()

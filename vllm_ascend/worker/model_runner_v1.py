@@ -61,7 +61,10 @@ from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
+    CommonAttentionMetadata,
+)
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -168,8 +171,10 @@ from vllm_ascend.utils import (
 )
 from vllm_ascend.worker.npu_input_batch import NPUInputBatch
 from vllm_ascend.worker.pcp_utils import PCPManager
-
-from vllm_ascend.worker.edge_cloud.execute_model_bundle import _ExecuteModelBundle
+from vllm_ascend.worker.edge_cloud.execute_model_bundle import (
+    _ExecuteModelBundle,
+    _MergedAttnContext,
+)
 
 from vllm_ascend.ascend_forward_context import (  # isort: skip
     MoECommType,
@@ -316,6 +321,29 @@ class EdgeCloudSegment(torch.nn.Module):
         )
 
 class NPUModelRunner(GPUModelRunner):
+    # ------------------------------------------------------------------
+    # Class-level sync state for shared-model-edge KV cache global remap
+    # ------------------------------------------------------------------
+    # When the shared-model edge runs in ``head_tail`` mode, every
+    # dp_rank worker's ``NPUModelRunner.initialize_kv_cache`` is called
+    # independently and produces a per-dp_rank ``KVCacheConfig``. To
+    # allow a single batched forward to address the union of all dp_rank
+    # KV blocks as one global buffer, the runners coordinate here:
+    #
+    # - ``_KV_CACHE_CONFIGS_PER_DP_RANK``: each runner registers its
+    #   config under its own ``data_parallel_rank``. Last writer wins
+    #   the construction.
+    # - ``_KV_CACHE_CONSTRUCTED``: set by the LAST caller after the
+    #   global buffer is built and bound; subsequent entries (e.g.
+    #   unit tests calling ``initialize_kv_cache`` twice) short-circuit.
+    #
+    # These are class-level (not module-level) because the state
+    # conceptually belongs to the runner class — the worker module
+    # doesn't need to import ``KVCacheConfig`` or know about the
+    # construction protocol.
+    _KV_CACHE_CONFIGS_PER_DP_RANK: "dict[int, KVCacheConfig]" = {}
+    _KV_CACHE_CONSTRUCTED: bool = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # TODO(qcs): These manual pad and unpad for GPUModelRunner are
         # used to expand some buffers, which need to be reverted after
@@ -2828,6 +2856,7 @@ class NPUModelRunner(GPUModelRunner):
     def execute_model_batched_head(
         self,
         bundles: list[_ExecuteModelBundle],
+        batched_dp_ranks: list[int] | None = None,
     ) -> list[IntermediateTensors]:
         """1 batched head model_forward = 1 ``model.embed_tokens``.
 
@@ -2843,82 +2872,96 @@ class NPUModelRunner(GPUModelRunner):
         """
         dp_size = len(bundles)
 
-        # All bundles in a round come from the same
-        # ``_determine_batch_execution_and_padding`` condition, so
-        # the per-bundle fields that are ``| None`` are either
-        # None for every bundle or non-None for every bundle.
-        # ``torch.cat`` cannot accept None elements, so for each
-        # such field we short-circuit: if any bundle has it as
-        # None, the merged value is None (or an empty-tensor
-        # placeholder for ``input_ids`` / ``positions`` /
-        # ``num_tokens_across_dp``, since the downstream
-        # ``_model_forward`` accepts None for those).
-        if all(b.input_ids is not None for b in bundles):
-            merged_input_ids = torch.cat([b.input_ids for b in bundles])
-        else:
-            merged_input_ids = None
-        if all(b.positions is not None for b in bundles):
-            # ``positions`` is 1D ``[N]`` for plain text models and
-            # 2D ``[mrope_dim, N]`` for mrope / xdrope models
-            # (see ``_preprocess`` upstream). ``torch.cat`` along
-            # the token axis means:
-            #   - 1D: dim=0  (the only dim)
-            #   - 2D: dim=1  (mrope_dim is fixed; token dim is
-            #     the inner axis)
-            # All per-dp_rank ``N`` values differ, so the wrong
-            # dim would error with "Sizes of tensors must match
-            # except in the concatenating dimension".
-            # All per-dp_rank ``positions`` tensors share the
-            # same dimensionality (same model, same
-            # text / mrope / xdrope path) — pick the first
-            # bundle's shape to determine the cat dim.
-            cat_dim = bundles[0].positions.dim() - 1
-            merged_positions = torch.cat(
-                [b.positions for b in bundles], dim=cat_dim)
-        else:
-            merged_positions = None
-        # ``input_ids`` and ``inputs_embeds`` are mutually
-        # exclusive: text path → ``input_ids``, mm path →
-        # ``inputs_embeds``. Forwarding both correctly requires
-        # cat-ing the mm-side tensor when present and letting
-        # ``forward_edge_cloud_segment`` (segment_a) pick the
-        # right one. We pass both; the segment wrapper
-        # internally prefers ``inputs_embeds`` when non-None
-        # (see qwen3_5_edge_cloud.py ``is_first_segment``
-        # branch).
-        if all(b.inputs_embeds is not None for b in bundles):
-            merged_inputs_embeds = torch.cat(
-                [b.inputs_embeds for b in bundles])
-        else:
-            merged_inputs_embeds = None
-        num_tokens_merged = (
-            merged_input_ids.shape[0] if merged_input_ids is not None
-            else (merged_inputs_embeds.shape[0]
-                  if merged_inputs_embeds is not None else 0))
-        num_tokens_padded_merged = sum(b.num_tokens_padded for b in bundles)
-        # The batched head segment runs as a single merged
-        # forward — there is no SP / DP all-gather that
-        # needs the per-dp_rank padded token counts. The
-        # forward-context consumers (MoE comm-method
-        # selector at line 91, post-segment custom ops)
-        # fall back to ``num_tokens`` when
-        # ``num_tokens_across_dp`` is ``None``. The
-        # per-dp_rank vector is also ambiguous in a
-        # partial round (some dp_ranks may not have
-        # produced a batched marker), so we pass ``None``
-        # rather than reconstructing it.
+        # Per-bundle actual (non-padded) token counts. The
+        # cudagraph dispatcher pads each dp_rank's tensors to its
+        # own cudagraph alignment (``num_tokens_padded``), but
+        # the merged forward is single-shot (no cudagraph
+        # capture — see ``invalid_modes={CUDAGraphMode.FULL}``
+        # below) so we concatenate the *actual* tokens and let
+        # the merged forward produce an actual-shaped output.
+        # Padding would otherwise waste compute on padded slots.
+        n_actuals = [
+            b.attn_metadata[0][
+                next(iter(b.attn_metadata[0]))].num_actual_tokens
+            if isinstance(b.attn_metadata, list) and b.attn_metadata
+            else next(iter(b.attn_metadata.values())).num_actual_tokens
+            for b in bundles
+        ]
+
+        # Total merged actual token count (sum across dp_ranks
+        # — the cudagraph dispatcher pads each dp_rank to its
+        # own alignment, but the merged forward is single-shot
+        # and consumes only the actual tokens). The if/else
+        # below builds the actual trimmed-and-catted merged
+        # tensors (``merged_input_ids`` /
+        # ``merged_positions`` / ``merged_inputs_embeds``).
+        num_tokens_merged = sum(n_actuals)
         num_tokens_across_dp_merged = None
 
         any_bundle = bundles[0]
+        # Non-embedding_only edge runs attention in the head
+        # segment; embedding_only edges skip attention and pass
+        # ``any_bundle.attn_metadata`` as a placeholder.
+        is_non_embedding_only_edge = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and self.edge_cloud_cfg.mode != "embedding_only")
+        if is_non_embedding_only_edge:
+            assert batched_dp_ranks is not None, (
+                "execute_model_batched_head: batched_dp_ranks required "
+                "for non-embedding_only edge mode.")
+            ctx = self._get_or_build_merged_attn_ctx(
+                bundles, batched_dp_ranks)
+            head_attn_metadata: Any = ctx.merged_attn_metadata
+            batch_descriptor = ctx.merged_batch_descriptor
+            # ``num_tokens_padded_merged`` is the cudagraph-
+            # dispatched merged padded count (NOT a per-dp_rank
+            # sum — summing would over-allocate the buffer).
+            num_tokens_padded_merged = ctx.num_tokens_padded_merged
+            # Reuse the trimmed-and-catted merged tensors
+            # cached in ctx (head and tail share the same
+            # per-dp_rank batches — 1:1 token mapping via
+            # cloud middle).
+            merged_input_ids = ctx.merged_input_ids
+            merged_positions = ctx.merged_positions
+            merged_inputs_embeds = ctx.merged_inputs_embeds
+        else:
+            head_attn_metadata = any_bundle.attn_metadata
+            batch_descriptor = any_bundle.batch_desc
+            num_tokens_padded_merged = sum(
+                b.num_tokens_padded for b in bundles)
+            # No merged ctx (cloud / non-edge path) — build
+            # the trimmed tensors locally for head (tail is not
+            # in this path).
+            if all(b.input_ids is not None for b in bundles):
+                merged_input_ids = torch.cat(
+                    [b.input_ids[:n]
+                     for b, n in zip(bundles, n_actuals)])
+            else:
+                merged_input_ids = None
+            if all(b.positions is not None for b in bundles):
+                cat_dim = bundles[0].positions.dim() - 1
+                merged_positions = torch.cat(
+                    [b.positions[..., :n]
+                     for b, n in zip(bundles, n_actuals)],
+                    dim=cat_dim)
+            else:
+                merged_positions = None
+            if all(b.inputs_embeds is not None for b in bundles):
+                merged_inputs_embeds = torch.cat(
+                    [b.inputs_embeds[:n]
+                     for b, n in zip(bundles, n_actuals)])
+            else:
+                merged_inputs_embeds = None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
-                attn_metadata=any_bundle.attn_metadata,
+                attn_metadata=head_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens_padded_merged,
                 num_tokens_across_dp=num_tokens_across_dp_merged,
                 aclgraph_runtime_mode=any_bundle.cudagraph_mode,
-                batch_descriptor=any_bundle.batch_desc,
+                batch_descriptor=batch_descriptor,
                 num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
                 max_tokens_across_pcp=(0 if self.pcp_size == 1
@@ -2934,14 +2977,13 @@ class NPUModelRunner(GPUModelRunner):
                 merged_inputs_embeds,
             )
 
+        # Per-dp_rank actual (non-padded) token counts. The
+        # merged forward produced ``hidden_states`` of shape
+        # ``[num_tokens_merged, hidden]`` (no padding) — slice
+        # back using actual counts.
         token_offsets = [0]
-        for b in bundles:
-            # ``input_ids`` and ``inputs_embeds`` are mutually
-            # exclusive: text path → ``input_ids``,
-            # mm path → ``inputs_embeds``. Use whichever is
-            # present for the per-dp_rank slice shape.
-            shape_src = b.input_ids if b.input_ids is not None else b.inputs_embeds
-            token_offsets.append(token_offsets[-1] + shape_src.shape[0])
+        for n in n_actuals:
+            token_offsets.append(token_offsets[-1] + n)
         results: list[IntermediateTensors] = []
         # Edge head segment's ``_model_forward`` returns an
         # ``IntermediateTensors`` (carrying ``hidden_states`` and
@@ -2975,6 +3017,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         bundles: list[_ExecuteModelBundle],
         intermediates: list[IntermediateTensors],
+        batched_dp_ranks: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]:
         """1 batched tail model_forward + 1 batched ``compute_logits``.
 
@@ -3003,6 +3046,19 @@ class NPUModelRunner(GPUModelRunner):
         # Per-dp_rank head slices come from
         # ``execute_model_batched_head``; both fields are
         # populated by the patched Qwen3.5 segment. Defensive
+        # Per-bundle actual token counts (defensive trim of
+        # the cloud-returned intermediates — cloud middle is
+        # 1:1 token pass-through, but we use the per-bundle
+        # ``num_actual_tokens`` from the bundle's attn metadata
+        # to make the trim explicit and avoid any cloud-side
+        # padding leaking into the merged tensor).
+        n_actuals_tail = [
+            (b.attn_metadata[0][
+                next(iter(b.attn_metadata[0]))].num_actual_tokens
+             if isinstance(b.attn_metadata, list) and b.attn_metadata
+             else next(iter(b.attn_metadata.values())).num_actual_tokens)
+            for b in bundles
+        ]
         # short-circuit: if a per-dp_rank slice is ``None`` for
         # either field, the merged value is ``None`` and the
         # corresponding ``IntermediateTensors`` entry is
@@ -3011,12 +3067,14 @@ class NPUModelRunner(GPUModelRunner):
         # in the head-segment path).
         if all(it["hidden_states"] is not None for it in intermediates):
             merged_hidden = torch.cat(
-                [it["hidden_states"] for it in intermediates])
+                [it["hidden_states"][:n]
+                 for it, n in zip(intermediates, n_actuals_tail)])
         else:
             merged_hidden = None
         if all(it["residual"] is not None for it in intermediates):
             merged_residual = torch.cat(
-                [it["residual"] for it in intermediates])
+                [it["residual"][:n]
+                 for it, n in zip(intermediates, n_actuals_tail)])
         else:
             merged_residual = None
         merged_intermediate = IntermediateTensors({
@@ -3024,30 +3082,96 @@ class NPUModelRunner(GPUModelRunner):
             "residual": merged_residual,
         })
 
+        # Token offsets for ``logits_indices`` use the
+        # per-bundle actual count (NOT
+        # ``it["hidden_states"].shape[0]`` which equals the
+        # actual count in practice but is redundant given
+        # we just trimmed — explicit here for clarity and
+        # consistency with head segment).
         token_offsets = [0]
-        for it in intermediates:
-            if it["hidden_states"] is None:
-                token_offsets.append(token_offsets[-1])
-            else:
-                token_offsets.append(token_offsets[-1]
-                                     + it["hidden_states"].shape[0])
+        for n in n_actuals_tail:
+            token_offsets.append(token_offsets[-1] + n)
         merged_logits_indices = torch.cat(
             [bundles[i].logits_indices + token_offsets[i]
              for i in range(dp_size)])
 
         any_bundle = bundles[0]
+        # Non-embedding_only path: tail segment ALSO writes KV cache
+        # (each tail layer's reshape_and_cache writes its own K/V) —
+        # the merged attn_metadata must address the GLOBAL KV
+        # buffer with per-dp_rank offsets. Reuses the cached
+        # merged ctx from the head segment verbatim — every field
+        # (including ``num_actual_tokens``) is identical between
+        # head and tail because cloud middle is a 1:1 token mapping
+        # (``merged_input_ids.shape[0]`` ==
+        # ``merged_hidden.shape[0]``), so no per-layer mutation
+        # is needed here.
+        is_non_embedding_only_edge = (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and self.edge_cloud_cfg.mode != "embedding_only")
+        if is_non_embedding_only_edge:
+            assert batched_dp_ranks is not None, (
+                "execute_model_batched_tail: batched_dp_ranks required "
+                "for non-embedding_only edge mode.")
+            ctx = self._get_or_build_merged_attn_ctx(
+                bundles, batched_dp_ranks)
+            tail_attn_metadata: Any = ctx.merged_attn_metadata
+            batch_descriptor = ctx.merged_batch_descriptor
+            # ``num_tokens_padded_merged`` is the cudagraph-
+            # dispatched merged padded count (NOT a per-dp_rank
+            # sum — summing would over-allocate the buffer).
+            num_tokens_padded_merged = ctx.num_tokens_padded_merged
+        else:
+            tail_attn_metadata = any_bundle.attn_metadata
+            batch_descriptor = any_bundle.batch_desc
+            num_tokens_padded_merged = sum(
+                b.num_tokens_padded for b in bundles)
         kv_connector_output = None
+        # Mirror head segment's ``num_tokens_merged``:
+        # ``merged_input_ids``/``merged_inputs_embeds`` are not
+        # reconstructed here (tail doesn't need the cat-ed
+        # tensor), but the per-dp_rank token count
+        # (``bundle.input_ids.shape[0]`` or
+        # ``bundle.inputs_embeds.shape[0]`` for the mm path)
+        # is the same scalar that head used — they are
+        # 1:1 between head and tail because cloud middle is a
+        # 1:1 token mapping. Sum the per-dp_rank values to get
+        # the merged total the same way head does.
+        # Mirror head segment's ``num_tokens_merged`` (sum
+        # of per-dp_rank actuals, NOT padded counts).
+        # ``n_actuals_tail`` was defined above for the
+        # intermediates trim; reuse it here.
+        num_tokens_merged = sum(n_actuals_tail)
+        # The batched head segment runs as a single merged
+        # forward — there is no SP / DP all-gather that
+        # needs the per-dp_rank padded token counts. The
+        # forward-context consumers (MoE comm-method
+        # selector at line 91, post-segment custom ops)
+        # fall back to ``num_tokens`` when
+        # ``num_tokens_across_dp`` is ``None``. The
+        # per-dp_rank vector is also ambiguous in a
+        # partial round (some dp_ranks may not have
+        # produced a batched marker), so we pass ``None``
+        # rather than reconstructing it.
+        num_tokens_across_dp_merged = None
         with (
             record_function_or_nullcontext("forward"),
             set_ascend_forward_context(
-                attn_metadata=any_bundle.attn_metadata,
+                attn_metadata=tail_attn_metadata,
                 vllm_config=self.vllm_config,
-                num_tokens=any_bundle.num_tokens_padded,
-                num_tokens_across_dp=any_bundle.num_tokens_across_dp,
+                # Mirror head segment's merged forward-context:
+                # the tail segment also runs on the merged batch,
+                # so num_tokens / num_tokens_across_dp /
+                # batch_descriptor must reflect the merged sum
+                # (otherwise cudagraph dispatch keys / SP all-gather
+                # inputs would be inconsistent with the merged
+                # _model_forward call below).
+                num_tokens=num_tokens_padded_merged,
+                num_tokens_across_dp=num_tokens_across_dp_merged,
                 aclgraph_runtime_mode=any_bundle.cudagraph_mode,
-                batch_descriptor=any_bundle.batch_desc,
-                num_actual_tokens=(merged_hidden.shape[0]
-                                   if merged_hidden is not None else 0),
+                batch_descriptor=batch_descriptor,
+                num_actual_tokens=num_tokens_merged,
                 model_instance=self.model,
                 max_tokens_across_pcp=(0 if self.pcp_size == 1
                                        else self.pcp_manager.max_num_tokens_across_pcp),
@@ -3058,12 +3182,29 @@ class NPUModelRunner(GPUModelRunner):
                 **{"defer_finalize": True},
             ) as kv_connector_output,
         ):
+            # ``num_tokens_padded_merged`` is used by the forward
+            # context (set above); tail segment's ``_model_forward``
+            # consumes it for downstream kernels that read
+            # ``forward_context.num_tokens`` (e.g. MoE comm-method
+            # selector, post-segment custom ops).
+            # Reuse the trimmed merged tensors cached in the
+            # ctx (head and tail share the same per-dp_rank
+            # batches — 1:1 token mapping).
             hidden_states = self._model_forward(
-                any_bundle.num_tokens_padded,
-                any_bundle.input_ids,
-                any_bundle.positions,
+                num_tokens_padded_merged,
+                (ctx.merged_input_ids
+                 if (is_non_embedding_only_edge
+                     and ctx.merged_input_ids is not None)
+                 else any_bundle.input_ids),
+                (ctx.merged_positions
+                 if (is_non_embedding_only_edge
+                     and ctx.merged_positions is not None)
+                 else any_bundle.positions),
                 merged_intermediate,
-                any_bundle.inputs_embeds,
+                (ctx.merged_inputs_embeds
+                 if (is_non_embedding_only_edge
+                     and ctx.merged_inputs_embeds is not None)
+                 else any_bundle.inputs_embeds),
             )
 
         merged_sample_hidden_states = hidden_states[merged_logits_indices]
@@ -5110,9 +5251,46 @@ class NPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         """
         Initialize KV cache based on `kv_cache_config`.
+
         Args:
             kv_cache_config: Configuration for the KV cache, including the KV
             cache size of each layer
+
+        Edge-cloud non-embedding_only extension (single-NPU multi-DP only)
+        ----------------------------------------------------------------
+        When the edge runs in ``head_tail`` mode on a SINGLE NPU that
+        hosts ``data_parallel_size`` virtual DP workers, every dp_rank
+        worker receives a per-dp_rank ``KVCacheConfig`` whose
+        ``num_blocks`` reflects only that dp_rank's share. To allow a
+        single batched forward to address the union of all dp_rank KV
+        blocks as one global buffer, this method:
+
+        1. Registers the current worker's ``KVCacheConfig`` in the
+           class-level :attr:`NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK`
+           (keyed by ``data_parallel_rank``).
+        2. Checks — BEFORE calling ``_allocate_kv_cache_tensors`` —
+           whether every dp_rank has registered. If not, returns
+           immediately; per-dp_rank allocation is **deferred** in
+           favour of the global buffer the last caller will build.
+        3. If this worker is the last caller, flips
+           :attr:`NPUModelRunner._KV_CACHE_CONSTRUCTED = True`,
+           computes per-dp_rank block offsets and
+           ``global_num_blocks = sum(...)``, and delegates to
+           :meth:`_allocate_global_kv_cache_tensors` on THIS runner
+           to build the shared buffer.
+        4. Propagates the shared ``self.kv_caches`` reference to every
+           registered worker so all dp_ranks point at the same tensor.
+
+        The "last caller" can be ANY dp_rank worker — not restricted
+        to the leader. The leader's model_runner is used as the
+        executor (it owns the device), but detection happens here
+        without any leader-specific branch.
+
+        This branch is only taken when ALL of the following hold:
+        - ``edge_cloud_enabled``
+        - ``role == "edge"``
+        - ``mode != "embedding_only"`` (i.e. ``head_tail``)
+        - ``is_shared_model_edge`` (single-NPU multi-DP edge layout)
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
@@ -5148,6 +5326,7 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
+
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
         self.initialize_attn_backend(kv_cache_config)
         self.use_hybrid_blocks = len(self.attn_groups) > 1
@@ -5157,6 +5336,108 @@ class NPUModelRunner(GPUModelRunner):
         )
 
         self.may_reinitialize_input_batch(kv_cache_config)
+        # === Edge-cloud single-NPU multi-DP, head_tail mode ===
+        # Only the shared-model edge topology (single NPU, multiple
+        # DP ranks) needs the global KV buffer; other edge layouts
+        # (multi-NPU, single-DP) fall through to the standard
+        # per-dp_rank allocation below.
+        if (
+            self._edge_cloud_enabled
+            and self.edge_cloud_cfg.role == "edge"
+            and self.edge_cloud_cfg.mode != "embedding_only"
+            and self.parallel_config.is_shared_model_edge
+        ):
+            # ``_KV_CACHE_CONFIGS_PER_DP_RANK`` is pre-registered by
+            # :meth:`SharedModelEdgeWorker.initialize_from_config`
+            # (which knows ``self.local_rank`` — the unique virtual
+            # worker identifier in the shared-model edge topology —
+            # whereas ``self.parallel_config.data_parallel_rank`` is
+            # the same for every virtual worker on the edge since
+            # they all share the same NPU). The model_runner only
+            # READS the registry here.
+
+            dp_size = self.parallel_config.data_parallel_size
+            if (len(NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK)
+                    < dp_size):
+                # Not all dp_ranks have registered yet — defer to
+                # whoever registers last.
+                logger.info(
+                    "[EdgeCloud] head_tail shared-model edge: deferred "
+                    "allocation (%d/%d dp_ranks registered); waiting "
+                    "for the last caller.",
+                    len(NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK),
+                    dp_size,
+                )
+                return
+            if NPUModelRunner._KV_CACHE_CONSTRUCTED:
+                # Already built on a previous call — idempotent
+                # bail-out (e.g. unit tests that call
+                # initialize_kv_cache twice).
+                return
+
+            # Claim the construction slot. The flag is class-level on
+            # ``NPUModelRunner`` so a subsequent caller's check at
+            # the top of this branch will short-circuit.
+            NPUModelRunner._KV_CACHE_CONSTRUCTED = True
+
+            # Per-dp_rank block layout: dp_k's local physical block
+            # N maps to global physical block ``N * dp_size + k``
+            # (interleaved by dp_rank). Each dp_rank scheduler
+            # hands out LOCAL block_ids in [0, cfg.num_blocks);
+            # the global remap at batched-merge time is
+            # ``physical_id * dp_size + k`` (see
+            # ``_merge_layer_attn`` and the design doc §4.5).
+            sorted_configs = sorted(
+                NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK.items(),
+                key=lambda kv: kv[0])
+            per_dp_offsets: dict[int, int] = {}
+            per_dp_num_blocks: dict[int, int] = {}
+            for rank, cfg in sorted_configs:
+                # ``per_dp_offsets[rank]`` is the additive ``+ k``
+                # term in the remap formula
+                # ``physical_id * dp_size + k`` — not a start
+                # offset. The block-spacing factor ``dp_size`` is
+                # folded into the remap formula in
+                # ``_merge_layer_attn``.
+                per_dp_offsets[rank] = rank
+                per_dp_num_blocks[rank] = cfg.num_blocks
+            # Global physical block pool size: every dp_rank in
+            # the shared model edge reports the same
+            # ``num_blocks`` (the edge cloud shared model
+            # contract — ``data_parallel_rank`` is 0 for all
+            # virtual workers, so each scheduler sees the same
+            # available memory). We size the global pool to
+            # ``min(num_blocks) * dp_size`` (matches the
+            # ``template_dp_rank = min(...)`` selection in
+            # ``_allocate_global_kv_cache_tensors``) and interleave
+            # each dp_rank's slice at ``dp_size`` stride.
+            template_num_blocks = min(
+                cfg.num_blocks
+                for cfg in NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK.values())
+            global_num_blocks = template_num_blocks * dp_size
+
+            # Persist offsets on this runner. ``SharedModelEdgeWorker``
+            # is responsible for mirroring these onto every
+            # follower's model_runner so the batched-merge helpers
+            # (``_get_or_build_merged_attn_ctx``) can read them from
+            # whichever runner drives the merged forward.
+            self._per_dp_offsets = per_dp_offsets
+            self._per_dp_num_blocks = per_dp_num_blocks
+            self._global_num_blocks = global_num_blocks
+
+            # Allocate ONE global KV buffer on THIS runner (the last
+            # caller). ``bind_kv_cache`` mutates
+            # ``compilation_config.static_forward_context`` which
+            # is shared across all dp_rank runners (they all
+            # reference ``vllm_config.compilation_config`` and the
+            # Attention modules themselves are shared via
+            # ``bind_to_shared_model``), so binding on this runner
+            # is sufficient. ``SharedModelEdgeWorker`` mirrors the
+            # resulting ``self.kv_caches`` onto every follower's
+            # model_runner.
+            kv_caches = self._allocate_global_kv_cache_tensors(
+                NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK)
+            return
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
         # TODO: refactor the logic of attention
         # Initialize drafter attention group initialization
@@ -5170,6 +5451,29 @@ class NPUModelRunner(GPUModelRunner):
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
+
+        if self.model_config.enable_return_routed_experts:
+            self.init_routed_experts_capturer()
+    
+    def initialize_kv_cache_post(self):
+        # NOTE: do NOT call ``initialize_kv_cache_tensors`` here —
+        # the helper has already done the allocation + reshape +
+        # ``bind_kv_cache`` once. We only run the downstream
+        # hooks (drafter, KV transfer, routed-experts capturer).
+
+        if self.speculative_config and (
+            self.speculative_config.use_eagle()
+            or self.speculative_config.uses_draft_model()):
+            assert isinstance(
+                self.drafter,
+                AscendEagleProposer | AscendDflashProposer
+                | AscendDraftModelProposer)
+            block_size = (
+                self.kernel_block_sizes[0]
+                if isinstance(self.kernel_block_sizes, list)
+                else self.kernel_block_sizes)
+            self.drafter.initialize_attn_backend(
+                self.kv_cache_config, block_size)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
@@ -5473,6 +5777,1066 @@ class NPUModelRunner(GPUModelRunner):
             storage_offset_bytes += stride[0] * dtype_size
         return reshaped_kv_tensors
 
+    def _allocate_global_kv_cache_tensors(
+        self,
+        kv_cache_config_per_dp: dict[int, KVCacheConfig],
+    ) -> dict[str, torch.Tensor]:
+        """Allocate ONE global KV buffer that spans every dp_rank's blocks.
+
+        Called once on the LAST caller's model_runner by
+        :meth:`initialize_kv_cache` after every dp_rank has registered
+        its ``KVCacheConfig``.
+
+        Implementation
+        --------------
+        1. Pick the smallest ``num_blocks`` across dp_ranks as the
+           "template" config — it has the smallest per-tensor
+           ``size`` for each layer (since ``size`` is linear in
+           ``num_blocks``).
+        2. Build a synthetic ``KVCacheConfig`` that mirrors the
+           template but with ``num_blocks = global_num_blocks`` and
+           each ``kv_cache_tensor.size`` scaled by
+           ``global_num_blocks / template.num_blocks``.
+        3. Delegate to the existing
+           :meth:`_allocate_kv_cache_tensors` +
+           :meth:`_reshape_kv_cache_tensors` +
+           ``bind_kv_cache`` chain via
+           :meth:`initialize_kv_cache_tensors` to allocate + bind
+           the global buffer. The result populates the leader's
+           ``self.kv_caches`` and binds the forward context exactly
+           once.
+        4. Mirror the shared tensor reference onto every follower
+           worker (done by the caller
+           :meth:`initialize_kv_cache`).
+
+        Returns the global ``kv_caches`` dict (``{layer_name: tensor}``)
+        for callers that want to introspect it; ``self.kv_caches`` is
+        also populated as a side effect.
+        """
+        if not kv_cache_config_per_dp:
+            raise RuntimeError(
+                "_allocate_global_kv_cache_tensors called with empty "
+                "kv_cache_config_per_dp")
+
+        # 1. Pick the template config (smallest num_blocks). All
+        #    configs share the same layer spec / block_size /
+        #    dtype / head layout, only ``num_blocks`` and the
+        #    resulting ``size`` differ.
+        template_dp_rank = min(
+            kv_cache_config_per_dp,
+            key=lambda k: kv_cache_config_per_dp[k].num_blocks)
+        template_cfg = kv_cache_config_per_dp[template_dp_rank]
+        global_num_blocks = sum(
+            cfg.num_blocks for cfg in kv_cache_config_per_dp.values())
+        if global_num_blocks <= template_cfg.num_blocks:
+            raise RuntimeError(
+                "Global num_blocks (%d) must exceed template num_blocks "
+                "(%d, dp_rank=%d). This indicates a dp_rank did not "
+                "register a positive num_blocks."
+                % (global_num_blocks, template_cfg.num_blocks,
+                   template_dp_rank))
+
+        # 2. Build the synthetic config with scaled sizes.
+        from vllm.v1.kv_cache_interface import KVCacheTensor
+        synthetic = deepcopy(template_cfg)
+        scale = global_num_blocks / template_cfg.num_blocks
+        scaled_tensors: list[KVCacheTensor] = []
+        for tensor in template_cfg.kv_cache_tensors:
+            scaled_tensors.append(
+                KVCacheTensor(
+                    size=int(tensor.size * global_num_blocks // template_cfg.num_blocks),
+                    shared_by=list(tensor.shared_by),
+                ))
+        synthetic = replace(
+            synthetic,
+            num_blocks=global_num_blocks,
+            kv_cache_tensors=scaled_tensors,
+        )
+        # Run the SAME init chain as the standard
+        # ``initialize_kv_cache`` path (with ``synthetic`` replacing
+        # the per-dp_rank config) — this is the last caller's own
+        # self-initialization. Followers skip this entirely; their
+        # per-runner state is set up by
+        # :meth:`initialize_kv_cache_post` (after ``attn_groups``
+        # is mirrored onto their runner by
+        # ``SharedModelEdgeWorker.initialize_from_config``).
+        kv_caches = self.initialize_kv_cache_tensors(synthetic)
+
+        if has_kv_transfer_group():
+            get_kv_transfer_group().register_kv_caches(kv_caches)
+
+        logger.info(
+            "[EdgeCloud] head_tail shared-model edge: allocated global "
+            "KV buffer of %d blocks (template dp_rank=%d, %d blocks; "
+            "scale=%.2fx across %d dp_ranks).",
+            global_num_blocks, template_dp_rank, template_cfg.num_blocks,
+            scale, len(kv_cache_config_per_dp))
+        return kv_caches
+
+    # ------------------------------------------------------------------
+    # Merged attn ctx (head_tail shared-model edge batched forward)
+    # ------------------------------------------------------------------
+    # The two helpers below build / cache a merged ``AscendCommonAttentionMetadata``
+    # spanning every dp_rank's request batch. They are called by the
+    # upstream ``SharedModelEdgeWorker._BatchedExecuteMarker.run_batched_head``
+    # / ``drain_batched_round`` and consumed by
+    # :meth:`execute_model_batched_head` / ``_tail``. They live on the
+    # model runner (not on the worker) because:
+    #
+    # 1. They read ``self._per_dp_offsets`` and ``self.device`` —
+    #    both runner-internal state.
+    # 2. They construct tensors on the runner's device.
+    # 3. The cache (``self._merged_attn_ctx_cache``) is per-runner
+    #    state; clearing it at end-of-round is the runner's concern.
+    #
+    # Field-by-field merge strategy follows the §4.5 decision table in
+    # ``non_embedding_only_support.md``:
+    #
+    # - block-id-derived (block_table_tensor) → + per_dp_offsets[k]
+    # - slot-derived (slot_mapping)            → + per_dp_offsets[k]
+    #                                              (slot_mapping 已是
+    #                                              slot 单位 = block_id *
+    #                                              block_size + slot_in_block,
+    #                                              见 vllm/v1/worker/
+    #                                              block_table.py:378)
+    # - token-count-derived (query_start_loc) → cumsum prior token 偏移
+    # - 纯 token 计数 (seq_lens / positions / is_prefilling) → 直接 concat
+    # - 标量                                            → sum / max / same
+
+    def _get_bpb_for_layer(self, layer_name: str) -> int:
+        """Look up ``blocks_per_phys_block`` for the kv_cache_group
+        this layer belongs to.
+
+        Each kv_cache_group has its own ``BlockTable`` with its
+        own ``blocks_per_phys_block`` (see
+        vllm_ascend/worker/block_table.py:47,67,72). Attention
+        groups in hybrid mode have ``bpb > 1``; MambaSpec groups
+        always have ``bpb == 1`` (``kernel_sizes=[0]``).
+
+        The merge helpers use ``bpb`` to convert per-dp_rank
+        local (logical) block_ids to the global physical-block
+        address space (e.g. ``block_tables`` /
+        ``non_spec_state_indices_tensor`` in
+        ``_merge_layer_attn`` / ``_merge_gdn_layer_attn``).
+        """
+        for group_idx, group in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            if layer_name in group.layer_names:
+                return (
+                    self.input_batch.block_table
+                    .block_tables[group_idx].blocks_per_phys_block
+                )
+        raise KeyError(
+            f"Layer {layer_name!r} not found in any "
+            f"kv_cache_group")
+
+    def _is_c8_attn_layer(self, layer_name: str) -> bool:
+        """Return whether ``layer_name`` uses the C8 (INT8 KV cache)
+        backend.
+
+        The C8 backend
+        (``vllm_ascend.attention.attention_v1.AscendC8AttentionBackendImpl``)
+        explicitly splits the merged batch into decode / prefill
+        sub-batches in Python
+        (``_forward_c8_chunked_prefill``). That split assumes a
+        contiguous ``[decodes…][prefills…]`` layout, which the
+        simple ``block_tables`` / ``slot_mapping`` /
+        ``actual_seq_lengths_q`` concat in ``_merge_layer_attn`` does
+        NOT guarantee when different dp_ranks have different
+        per-dp_rank ``attn_state``. We therefore refuse C8 layers
+        in the batched path; per-dp_rank execution handles them.
+
+        Detection TODO: walk ``self.attn_groups`` /
+        ``self.runner_only_attn_layers`` to find this layer's
+        attention backend instance and check
+        ``isinstance(impl, AscendC8AttentionBackendImpl)``. For now
+        the standard edge cloud shared model uses the non-C8
+        ``AscendAttentionBackendImpl`` path so this is a no-op.
+        """
+        # Reference ``layer_name`` so the IDE / lint does not flag
+        # the parameter as unused — the real detection logic will
+        # consume it once implemented. (The edge cloud shared model
+        # never runs through a C8-quantized attention layer today,
+        # so returning False is correct in practice.)
+        del layer_name
+        return False
+
+    def _get_or_build_merged_attn_ctx(
+        self,
+        bundles: list["_ExecuteModelBundle"],
+        batched_dp_ranks: list[int],
+    ) -> "_MergedAttnContext":
+        """Build (or reuse cached) merged per-layer attn state.
+
+        ``bundle.attn_metadata`` is a per-layer dict
+        (``AttnMetadataDict = dict[layer_name, AscendMetadata]``);
+        the attention kernel reads it as ``forward_context.attn_metadata[layer]``
+        per layer. We merge **per layer** across dp_ranks so that the
+        result is itself a per-layer dict that the kernel can consume
+        unchanged.
+
+        Called once per round on the LEADER runner by
+        ``_BatchedExecuteMarker.run_batched_head``;
+        ``drain_batched_round`` reuses the cache for the tail
+        segment.
+        """
+        cached = getattr(self, "_merged_attn_ctx_cache", None)
+        if cached is not None:
+            return cached
+
+        per_dp_offsets = getattr(self, "_per_dp_offsets", None)
+        if per_dp_offsets is None:
+            raise RuntimeError(
+                "NPUModelRunner._get_or_build_merged_attn_ctx called but "
+                "self._per_dp_offsets is unset. Did initialize_kv_cache "
+                "run for all dp_ranks?")
+
+        # 1. Iterate layer keys. ``bundles[0].attn_metadata`` is the
+        # template (all dp_ranks share the same layer set in
+        # ``_build_attention_metadata``). ``b.attn_metadata`` may be a
+        # list (ubatching) — only the [0] entry is the actual metadata.
+        def _layer_dict(b: "_ExecuteModelBundle") -> dict:
+            md = b.attn_metadata
+            return md[0] if isinstance(md, list) else md
+
+        template_layers = list(_layer_dict(bundles[0]).keys())
+        for b in bundles[1:]:
+            assert _layer_dict(b).keys() == set(template_layers), (
+                "dp_rank attn_metadata layer sets must agree across "
+                "dp_ranks for batched forward")
+
+        merged_attn_metadata: dict = {}
+        # Per-layer dispatch: different layers in the same model
+        # may use different attention backends (e.g. Qwen3-next has
+        # both self-attn ``AscendMetadata`` and linear-attn
+        # ``GDNAttentionMetadata`` layers).
+        from vllm_ascend.attention.attention_v1 import AscendMetadata
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+        def _merge_layer(layer_name: str):
+            md_template = _layer_dict(bundles[0])[layer_name]
+            # Per-layer bpb: attention groups in hybrid mode have
+            # bpb > 1; MambaSpec groups always have bpb == 1.
+            bpb = self._get_bpb_for_layer(layer_name)
+            if isinstance(md_template, AscendMetadata):
+                return self._merge_layer_attn(
+                    layer_name, bundles, batched_dp_ranks,
+                    per_dp_offsets, bpb)
+            elif isinstance(md_template, GDNAttentionMetadata):
+                return self._merge_gdn_layer_attn(
+                    layer_name, bundles, batched_dp_ranks,
+                    per_dp_offsets, bpb)
+            else:
+                raise NotImplementedError(
+                    f"Unsupported attention metadata type for "
+                    f"layer {layer_name!r}: "
+                    f"{type(md_template).__name__}; batched forward "
+                    f"currently supports AscendMetadata and "
+                    f"GDNAttentionMetadata only.")
+
+        for layer_name in template_layers:
+            merged_attn_metadata[layer_name] = _merge_layer(layer_name)
+
+        # 2. Build the merged BatchDescriptor (cudagraph dispatch key).
+        # Compute the merged actual token count from any layer's
+        # merged ``num_actual_tokens`` (all layers see the same
+        # merged batch so the count is identical).
+        from vllm.forward_context import BatchDescriptor
+        first_merged = next(iter(merged_attn_metadata.values()))
+        num_tokens_merged = first_merged.num_actual_tokens
+        any_batch_desc = bundles[0].batch_desc
+        if any_batch_desc is None:
+            # No cudagraph dispatch needed.
+            merged_batch_descriptor = None
+            num_tokens_padded_merged = num_tokens_merged
+        else:
+            # Dispatch cudagraph for the merged batch to get
+            # the padded token count and the merged batch
+            # descriptor. Per-dp_rank ``num_tokens_padded`` is
+            # each dp_rank's cudagraph-aligned padded count —
+            # summing them would over-allocate the buffer (e.g.
+            # 4 dp_ranks each padded to 16 tokens would request
+            # 64 tokens when only 24 actual tokens are
+            # processed). The cudagraph dispatcher applies the
+            # right padding for the merged total.
+            #
+            # ``uniform_decode`` is the dispatcher's
+            # ``BatchDescriptor.uniform`` flag — True only when
+            # ALL bundles are uniform (all 1-token decode); the
+            # merged batch otherwise is mixed. We force
+            # ``invalid_modes={CUDAGraphMode.FULL}`` because
+            # the merged forward is one-shot, not cudagraph-
+            # captured.
+            has_lora_any = any(
+                b.batch_desc is not None and b.batch_desc.has_lora
+                for b in bundles)
+            uniform_decode_merged = all(
+                b.batch_desc is not None and b.batch_desc.uniform
+                for b in bundles)
+            num_active_loras_merged = sum(
+                (b.batch_desc.num_active_loras
+                 if b.batch_desc is not None else 0)
+                for b in bundles)
+            _, merged_batch_descriptor = self.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens_merged,
+                has_lora=has_lora_any,
+                uniform_decode=uniform_decode_merged,
+                valid_modes=None,
+                invalid_modes={CUDAGraphMode.FULL},
+                num_active_loras=num_active_loras_merged,
+            )
+            num_tokens_padded_merged = merged_batch_descriptor.num_tokens
+
+        # Per-bundle actual (non-padded) token counts. The
+        # cudagraph dispatcher pads each dp_rank's tensors to
+        # its own alignment, but the merged forward is
+        # single-shot (no cudagraph capture) so we want the
+        # *actual* merged tensors — trim each per-dp_rank
+        # tensor to ``n_actuals[k]`` before cat. Both head and
+        # tail segments share the same per-dp_rank batch (1:1
+        # token mapping via cloud middle), so caching the
+        # trimmed tensors here avoids recomputing in the tail.
+        def _actual_tokens(b: "_ExecuteModelBundle") -> int:
+            md = b.attn_metadata
+            if isinstance(md, list):
+                md = md[0][next(iter(md[0]))]
+            else:
+                md = next(iter(md.values()))
+            return md.num_actual_tokens
+
+        n_actuals = [_actual_tokens(b) for b in bundles]
+        if all(b.input_ids is not None for b in bundles):
+            merged_input_ids_ctx = torch.cat(
+                [b.input_ids[:n] for b, n in zip(bundles, n_actuals)])
+        else:
+            merged_input_ids_ctx = None
+        if all(b.positions is not None for b in bundles):
+            cat_dim_ctx = bundles[0].positions.dim() - 1
+            merged_positions_ctx = torch.cat(
+                [b.positions[..., :n]
+                 for b, n in zip(bundles, n_actuals)],
+                dim=cat_dim_ctx)
+        else:
+            merged_positions_ctx = None
+        if all(b.inputs_embeds is not None for b in bundles):
+            merged_inputs_embeds_ctx = torch.cat(
+                [b.inputs_embeds[:n]
+                 for b, n in zip(bundles, n_actuals)])
+        else:
+            merged_inputs_embeds_ctx = None
+
+        ctx = _MergedAttnContext(
+            merged_attn_metadata=merged_attn_metadata,
+            merged_batch_descriptor=merged_batch_descriptor,
+            num_tokens_padded_merged=num_tokens_padded_merged,
+            merged_input_ids=merged_input_ids_ctx,
+            merged_positions=merged_positions_ctx,
+            merged_inputs_embeds=merged_inputs_embeds_ctx,
+        )
+        self._merged_attn_ctx_cache = ctx
+        return ctx
+
+    def _merge_layer_attn(
+        self,
+        layer_name: str,
+        bundles: list["_ExecuteModelBundle"],
+        batched_dp_ranks: list[int],
+        per_dp_offsets: dict[int, int],
+        bpb: int,
+    ) -> Any:
+        """Merge one layer's ``AscendMetadata`` across dp_ranks.
+
+        Reads each bundle's per-layer ``AscendMetadata`` (the value
+        at ``bundles[i].attn_metadata[layer_name]`` — see
+        :class:`AscendMetadata` for the field list) and produces a
+        fresh ``AscendMetadata`` with batched-batch fields merged:
+
+        - ``query_start_loc``: cumsum token offsets.
+        - ``seq_lens`` / ``seq_lens_cpu``: direct concat.
+        - ``block_tables``: concat + ``per_dp_offsets[k]`` on
+          valid block_ids only (padded 0 entries stay 0).
+        - ``slot_mapping``: concat +
+          ``per_dp_offsets[k] * self.block_size`` on valid
+          slots only (padded ``-1`` entries stay ``-1``).
+          ``per_dp_offsets`` is in block-id units but
+          ``slot_mapping`` is in slot units (= block_id *
+          block_size + slot_in_block — see
+          vllm/v1/worker/block_table.py:378), so the block-id
+          offset must be multiplied by ``block_size`` to land
+          in the global buffer.
+        - ``actual_seq_lengths_q``: list extend.
+        - ``num_actual_tokens`` / ``num_decode_tokens`` /
+          ``num_prefills`` / ``num_decodes``: sum.
+        - ``max_query_len``: max.
+        - ``num_reqs``: inferred as ``seq_lens.shape[0]``.
+
+        Per-dp_rank-identical fields (``attn_state`` /
+        ``causal`` / ``model_runner_type`` / ``kvcomp_metadata``)
+        fall through from the first bundle. ``attn_mask`` /
+        ``reshape_cache_event`` / ``prefill`` / ``decode_meta`` are
+        layer-wise ATT-backend-specific; until the batched path
+        covers them we raise a NotImplementedError to surface the
+        limitation.
+        """
+        from vllm_ascend.attention.attention_v1 import AscendMetadata
+
+        def _layer_md(b: "_ExecuteModelBundle") -> Any:
+            d = b.attn_metadata
+            return d[0][layer_name] if isinstance(d, list) else d[layer_name]
+
+        any_md = _layer_md(bundles[0])
+        per_layer_mds = [_layer_md(b) for b in bundles]
+
+        # === Unify ``attn_state`` across dp_ranks ===
+        # For the non-C8 path (``AscendAttentionBackendImpl``) the
+        # kernel processes the entire merged batch in one call using
+        # ``actual_seq_lengths_q`` (cu_seqlen) to locate each
+        # request — it does NOT split by decode/prefill, so the
+        # request order in the merged batch is irrelevant. This
+        # lets us unify different per-dp_rank states to a single
+        # ``merged_attn_state`` and run the merged forward under
+        # the most general state.
+        states = [md.attn_state for md in per_layer_mds]
+        unique_states = set(states)
+        if len(unique_states) > 1:
+            if AscendAttentionState.SpecDecoding in unique_states:
+                raise NotImplementedError(
+                    f"Layer {layer_name}: cannot merge SpecDecoding "
+                    f"with other states {unique_states}; SpecDecoding "
+                    f"uses a separate tree path that the batched "
+                    f"forward does not yet support")
+            # All non-SpecDecoding combinations (DecodeOnly /
+            # PrefillNoCache / PrefillCacheHit / ChunkedPrefill
+            # mixing freely) collapse to ChunkedPrefill — the
+            # kernel's cu_seqlen-driven path handles any layout.
+            merged_attn_state = AscendAttentionState.ChunkedPrefill
+        else:
+            merged_attn_state = next(iter(unique_states))
+
+        # === C8 path detection ===
+        # The C8 (INT8 KV cache) backend
+        # (``AscendC8AttentionBackendImpl``) does split the batch
+        # into decode and prefill sub-batches explicitly in Python
+        # (``_forward_c8_chunked_prefill`` at attention_v1.py:1380+).
+        # That split assumes a contiguous decode→prefill layout
+        # which the simple ``block_tables`` / ``slot_mapping`` /
+        # ``actual_seq_lengths_q`` concat above does NOT guarantee
+        # when dp_ranks have different per-dp_rank states. Reject
+        # C8 layers for now until we add the explicit reorder pass
+        # documented in the design doc §4.6.
+        if self._is_c8_attn_layer(layer_name):
+            raise NotImplementedError(
+                f"Layer {layer_name}: C8 (INT8 KV cache) backend does "
+                f"not yet support batched forward; fall back to "
+                f"per-dp_rank execution for this layer.")
+
+        # === Sanity: per-dp_rank-identical fields (excluding attn_state) ===
+        for b in bundles[1:]:
+            md = _layer_md(b)
+            for f in ("causal", "model_runner_type", "attn_mask"):
+                lhs = getattr(md, f)
+                rhs = getattr(any_md, f)
+                # ``attn_mask`` is a torch.Tensor — ``!=`` on tensors
+                # returns a boolean tensor whose truthiness is
+                # ambiguous; use ``torch.equal`` for value comparison.
+                if isinstance(lhs, torch.Tensor) or isinstance(
+                        rhs, torch.Tensor):
+                    if not torch.equal(lhs, rhs):
+                        raise RuntimeError(
+                            f"Layer {layer_name}: dp_rank "
+                            f"b.attn_metadata[{f!r}] disagrees across "
+                            f"dp_ranks; cannot merge for batched forward")
+                elif lhs != rhs:
+                    raise RuntimeError(
+                        f"Layer {layer_name}: dp_rank "
+                        f"b.attn_metadata[{f!r}] disagrees across "
+                        f"dp_ranks; cannot merge for batched forward")
+        # ``attn_mask`` is built by ``AttentionMaskBuilder`` (process
+        # singleton, keyed only by ``model_config``) so it is
+        # identical across dp_ranks — fall through from any bundle.
+        # Fields that batched forward does not yet support: raise so
+        # the caller is forced to fall back to per-dp_rank execution
+        # (rather than silently producing wrong results).
+        for f in ("prefill", "decode_meta", "reshape_cache_event",
+                  "kvcomp_metadata"):
+            if any(getattr(_layer_md(b), f) is not None
+                   for b in bundles):
+                raise NotImplementedError(
+                    f"Layer {layer_name}: {f!r} is set on at least one "
+                    f"dp_rank; batched forward does not yet support "
+                    f"merging this field.")
+
+        # 1. query_start_loc (cumsum token offsets).
+        merged_query_start_loc = [0]
+        for b in bundles:
+            md = _layer_md(b)
+            n_reqs = md.seq_lens.shape[0]
+            if n_reqs > 0:
+                local = md.query_start_loc[1:n_reqs + 1]
+                cumulative = local + merged_query_start_loc[-1]
+                merged_query_start_loc.extend(cumulative.tolist())
+            else:
+                merged_query_start_loc.append(merged_query_start_loc[-1])
+        merged_query_start_loc = torch.tensor(
+            merged_query_start_loc, dtype=torch.int32, device=self.device,
+        )
+
+        # 2. seq_lens (concat — pure token counts).
+        merged_seq_lens = torch.cat(
+            [_layer_md(b).seq_lens for b in bundles])
+        merged_seq_lens_cpu = (
+            torch.cat([_layer_md(b).seq_lens_cpu for b in bundles])
+            if any_md.seq_lens_cpu is not None else None
+        )
+
+        # 3. block_tables (concat with per-dp_rank remap to
+        #    global logical block id, since
+        #    ``AscendMetadata.block_tables`` stores LOGICAL block
+        #    ids — see vllm_ascend/worker/block_table.py:79).
+        #
+        #    Per-dp_rank remap for dp_k's local logical block N:
+        #      step 1: logical → local physical
+        #              ``local_phys = N // bpb``
+        #              (``bpb = blocks_per_phys_block``; in
+        #              non-hybrid mode ``bpb == 1`` and this is
+        #              a no-op)
+        #      step 2: local physical → global physical
+        #              ``global_phys = local_phys * dp_size + k``
+        #              (interleave at ``dp_size`` stride;
+        #              ``per_dp_offsets[k] == k`` is the additive
+        #              slot within each interleave row — see the
+        #              layout in ``initialize_kv_cache``)
+        #      step 3: global physical → global logical
+        #              ``global_logical = global_phys * bpb
+        #                                + (N % bpb)``
+        #              (the offset within the physical block is
+        #              preserved)
+        #
+        #    Combined formula:
+        #    ``global_logical
+        #        = ((N // bpb) * dp_size + k) * bpb + (N % bpb)``
+        #    Padded 0 entries stay 0 so they don't collapse into
+        #    a valid global block_id that the attention kernel
+        #    might read past ``num_blocks_per_req[req_idx]``.
+        dp_size = self.parallel_config.data_parallel_size
+        merged_block_tables = torch.cat([
+            torch.where(
+                _layer_md(b).block_tables == 0,
+                _layer_md(b).block_tables,
+                # step 1+2: physical_local = N // bpb,
+                #          physical_global = physical_local * dp_size + k
+                # step 3: back to logical id
+                #         = physical_global * bpb + (N % bpb)
+                ((_layer_md(b).block_tables // bpb) * dp_size
+                 + per_dp_offsets[k]) * bpb
+                + (_layer_md(b).block_tables % bpb),
+            )
+            for b, k in zip(bundles, batched_dp_ranks)
+        ])
+
+        # 4. slot_mapping (concat with the same per-dp_rank
+        #    remap, expressed in physical slot units). The
+        #    ``slot_mapping`` value computed by
+        #    vllm_ascend/worker/block_table.py:206
+        #    (``block_numbers * self.block_size + block_offsets``)
+        #    is in *physical* slot units (the logical-slot formula
+        #    collapses to the physical slot via
+        #    ``physical_block_size = bpb * logical_block_size``
+        #    in hybrid mode). The remap for dp_k's local slot:
+        #      step 1: extract physical_block_id and offset
+        #              ``phys_block = slot // physical_block_size``
+        #              ``offset_in_block = slot % physical_block_size``
+        #      step 2: interleave the physical block id
+        #              ``new_phys_block = phys_block * dp_size + k``
+        #      step 3: reconstruct the slot
+        #              ``new_slot = new_phys_block * block_size
+        #                          + offset_in_block``
+        #
+        #    ``PAD_SLOT_ID`` (-1) entries stay ``PAD_SLOT_ID`` so
+        #    ``reshape_and_cache`` skips them.
+        bs = self.block_size
+        merged_slot_mapping = torch.cat([
+            torch.where(
+                _layer_md(b).slot_mapping == PAD_SLOT_ID,
+                _layer_md(b).slot_mapping,
+                # step 1: split into physical_block_id and offset
+                ((_layer_md(b).slot_mapping // bs) * dp_size
+                 + per_dp_offsets[k]) * bs  # step 2+3: new slot
+                + (_layer_md(b).slot_mapping % bs),
+            )
+            for b, k in zip(bundles, batched_dp_ranks)
+        ])
+
+        # 5. actual_seq_lengths_q = cu_seqlen of the merged
+        #    batch (i.e. ``merged_query_start_loc[1:]``).
+        #    ``actual_seq_lengths_q`` per dp_rank is also a cu_seqlen
+        #    (attention_v1.py:322:
+        #    ``actual_seq_lengths_q=query_start_loc_cpu[1:].tolist()``)
+        #    but it is in per-dp_rank-local cumulative form; the
+        #    merged version is the *global* cumulative form, which
+        #    is just ``merged_query_start_loc[1:]``.
+        merged_actual_seq_lengths_q = (
+            merged_query_start_loc[1:].tolist())
+
+        # 6. Scalar fields (sum / max).
+        merged_num_actual_tokens_pcp_padded = sum(
+            _layer_md(b).num_actual_tokens_pcp_padded for b in bundles)
+        merged_num_actual_tokens = sum(
+            _layer_md(b).num_actual_tokens for b in bundles)
+        merged_num_decode_tokens = sum(
+            _layer_md(b).num_decode_tokens for b in bundles)
+        merged_num_prefills = sum(
+            _layer_md(b).num_prefills for b in bundles)
+        merged_num_decodes = sum(
+            _layer_md(b).num_decodes for b in bundles)
+        merged_num_decodes_flatten = sum(
+            _layer_md(b).num_decodes_flatten for b in bundles)
+        merged_max_query_len = max(
+            _layer_md(b).max_query_len or 0 for b in bundles)
+
+        return AscendMetadata(
+            num_actual_tokens_pcp_padded=merged_num_actual_tokens_pcp_padded,
+            num_actual_tokens=merged_num_actual_tokens,
+            num_decode_tokens=merged_num_decode_tokens,
+            num_prefills=merged_num_prefills,
+            num_decodes=merged_num_decodes,
+            num_decodes_flatten=merged_num_decodes_flatten,
+            seq_lens=merged_seq_lens,
+            seq_lens_cpu=merged_seq_lens_cpu,
+            seq_lens_list=merged_seq_lens.cpu().tolist(),
+            actual_seq_lengths_q=merged_actual_seq_lengths_q,
+            query_start_loc=merged_query_start_loc,
+            max_query_len=merged_max_query_len,
+            block_tables=merged_block_tables,
+            slot_mapping=merged_slot_mapping,
+            # ``attn_mask`` is identical across dp_ranks (built by
+            # ``AttentionMaskBuilder`` singleton from ``model_config``
+            # alone — see attention_v1.py line 308) — fall through.
+            attn_mask=any_md.attn_mask,
+            # Unified across dp_ranks — see the attn_state-unify
+            # block at the top of this function.
+            attn_state=merged_attn_state,
+            causal=any_md.causal,
+            model_runner_type=any_md.model_runner_type,
+        )
+
+    def _merge_gdn_layer_attn(
+        self,
+        layer_name: str,
+        bundles: list["_ExecuteModelBundle"],
+        batched_dp_ranks: list[int],
+        per_dp_offsets: dict[int, int],
+        bpb: int,
+    ) -> Any:
+        """Merge one layer's ``GDNAttentionMetadata`` across dp_ranks.
+
+        Dispatches to :class:`GDNAttentionMetadata`'s 21 fields
+        (see ``non_embedding_only_support.md`` §3). Field-by-field
+        strategy:
+
+        - **A. scalar sums**: ``num_prefills`` /
+          ``num_prefill_tokens`` / ``num_decodes`` /
+          ``num_decode_tokens`` / ``num_spec_decodes`` /
+          ``num_spec_decode_tokens`` / ``num_actual_tokens``.
+        - **B. per-request tensors (concat dim=0, no offset)**:
+          ``has_initial_state`` / ``spec_sequence_masks`` /
+          ``num_accepted_tokens``.
+        - **C. cu_seqlen-style (cumsum concat with prior-token
+          offset)**: ``spec_query_start_loc`` (cumsum of
+          spec-subset token counts) and
+          ``non_spec_query_start_loc`` (cumsum of non-spec
+          counts). Each dp_rank's entries get added to the
+          running sum before being concatenated.
+        - **D. token indices (cat + prior-token-count offset)**:
+          ``spec_token_indx`` / ``non_spec_token_indx`` are
+          indices into the merged query tensor; each dp_rank's
+          indices are shifted by the cumulative token count of
+          all preceding dp_ranks before concatenation.
+        - **E. mamba state indices (cat, no offset)**:
+          ``spec_state_indices_tensor`` /
+          ``non_spec_state_indices_tensor`` index into the mamba
+          state pool (which is per-request, not per-block) —
+          they are NOT affected by ``per_dp_offsets`` and can
+          be concatenated directly.
+        - **F. derived (raise if non-None)**:
+          ``chunk_indices`` / ``chunk_offsets`` / ``nums_dict`` /
+          ``batch_ptr`` / ``token_chunk_offset_ptr`` are derived
+          by :class:`GDNAttentionMetadataBuilder`; until the
+          batched path runs that builder, raise on non-None.
+        """
+        from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+
+        def _layer_md(b: "_ExecuteModelBundle") -> Any:
+            d = b.attn_metadata
+            return d[0][layer_name] if isinstance(d, list) else d[layer_name]
+
+        any_md = _layer_md(bundles[0])
+
+        # Sanity: per-dp_rank fields that should agree. GDN doesn't
+        # have many per-batch-scalar fields beyond the num_* ones.
+        for b in bundles[1:]:
+            md = _layer_md(b)
+            for f in ("use_spec_decode", "num_spec"):
+                # These are builder-internal flags; we don't expose
+                # them on GDNAttentionMetadata but the builder
+                # state should be identical across dp_ranks (same
+                # vllm_config). Verified indirectly by the fact
+                # that ``num_spec`` would be identical.
+                pass
+            for f in ("num_spec", "use_spec_decode"):
+                # Not on the metadata; documented for completeness.
+                pass
+
+        # Per-layer metadata for the GDN layer (one per dp_rank).
+        per_layer_mds = [_layer_md(b) for b in bundles]
+
+        # A. scalar sums.
+        merged_num_prefills = sum(
+            _layer_md(b).num_prefills for b in bundles)
+        merged_num_prefill_tokens = sum(
+            _layer_md(b).num_prefill_tokens for b in bundles)
+        merged_num_decodes = sum(
+            _layer_md(b).num_decodes for b in bundles)
+        merged_num_decode_tokens = sum(
+            _layer_md(b).num_decode_tokens for b in bundles)
+        merged_num_spec_decodes = sum(
+            _layer_md(b).num_spec_decodes for b in bundles)
+        merged_num_spec_decode_tokens = sum(
+            _layer_md(b).num_spec_decode_tokens for b in bundles)
+        merged_num_actual_tokens = sum(
+            _layer_md(b).num_actual_tokens for b in bundles)
+
+        # B. per-request tensors (concat dim=0).
+        def _cat_or_none(getter):
+            """Cat per-dp_rank tensors, or return None if every
+            dp_rank's value is None. Raise if the field is mixed
+            (some dp_rank None, some not) — an inconsistent state
+            that the merged batch can't represent cleanly."""
+            values = [getter(_layer_md(b)) for b in bundles]
+            if all(v is None for v in values):
+                return None
+            if any(v is None for v in values):
+                raise NotImplementedError(
+                    f"Layer {layer_name}: field is None on some "
+                    f"dp_ranks and non-None on others; batched forward "
+                    f"requires uniform None-ness.")
+            return torch.cat(values)
+
+        # ``has_initial_state`` is a per-non-spec bool tensor of
+        # shape ``[num_non_spec_reqs_k]`` (covers BOTH decodes
+        # and prefills — gdn_attn.py:337:
+        # ``has_initial_state = context_lens_tensor > 0`` then
+        # filtered by ``~spec_sequence_masks_cpu``; decodes
+        # always have ``context_lens > 0`` so their entries are
+        # True, prefills are True iff context_lens > 0).
+        #
+        # ``_ORIGINAL_BUILD`` only sets it when ``num_prefills > 0``
+        # (gdn_attn.py:336), so a pure-decode dp_rank reports
+        # ``None``. For the merged batch the kernel
+        # ``clear_ssm_states`` requires the tensor to span ALL
+        # non-spec reqs (decodes + prefills), so a missing
+        # dp_rank's decode portion must be filled in with
+        # all-True (decodes always have prior cache, so no
+        # row should be cleared). The merged shape is
+        # ``[sum(num_decodes_k + num_prefills_k)]``
+        # = ``[merged_num_non_spec_reqs]``.
+        device = self.device
+        parts: list[torch.Tensor] = []
+        for md in per_layer_mds:
+            n_non_spec = md.num_decodes + md.num_prefills
+            if md.has_initial_state is not None:
+                parts.append(md.has_initial_state)
+            elif n_non_spec > 0:
+                # Pure-decode dp_rank — fill the decode rows
+                # with all-True (decode reqs always have
+                # context_lens > 0, so no clearing).
+                parts.append(
+                    torch.ones(n_non_spec, dtype=torch.bool,
+                               device=device))
+            # else: empty dp_rank — contributes nothing
+        merged_has_initial_state = (
+            torch.cat(parts) if parts else None)
+        merged_spec_sequence_masks = _cat_or_none(
+            lambda md: md.spec_sequence_masks)
+        merged_num_accepted_tokens = _cat_or_none(
+            lambda md: md.num_accepted_tokens)
+
+        # E. mamba state indices. ``spec_state_indices_tensor`` /
+        # ``non_spec_state_indices_tensor`` are block_ids extracted
+        # from the request's first block-table row
+        # (gdn_attn.py:207: ``non_spec_state_indices_tensor =
+        # block_table_tensor[:, 0]``) — they index the GDN state
+        # pool (``ssm_state[idx]`` / ``conv_state[idx]`` in
+        # gdn.py:310, 325). The state pool is allocated from
+        # ``kv_cache_config.kv_cache_tensors`` (the same global
+        # pool as attention KV cache), so the local block_ids
+        # must be remapped to global via the same per-dp_rank
+        # physical-block interleave used for ``block_tables``:
+        #
+        #      step 1: logical → local physical
+        #              ``local_phys = N // bpb``
+        #      step 2: local physical → global physical
+        #              ``global_phys = local_phys * dp_size + k``
+        #      step 3: global physical → global logical
+        #              ``global_logical = global_phys * bpb
+        #                                + (N % bpb)``
+        #
+        # Combined: ``((N // bpb) * dp_size + k) * bpb + (N % bpb)``.
+        # For MambaSpec layers ``bpb == 1`` always (see
+        # vllm_ascend/worker/block_table.py:47,67,72 — MambaSpec
+        # uses ``kernel_sizes=[0]`` which sets
+        # ``blocks_per_phys_block = 1``), so this collapses to
+        # ``N * dp_size + k``.
+        # Cudagraph-padded entries are set to ``NULL_BLOCK_ID``
+        # (= 0, see vllm/v1/attention/backends/utils.py:45) but
+        # block_id 0 is also a valid physical block, so we cannot
+        # use NULL_BLOCK_ID as a sentinel for protection. The GDN
+        # kernel only reads the first ``num_actual_tokens`` /
+        # ``num_spec_decodes`` entries, so padding is never
+        # accessed regardless of its value.
+        dp_size = self.parallel_config.data_parallel_size
+        def _remap_state_indices(getter):
+            values = [getter(_layer_md(b)) for b in bundles]
+            if all(v is None for v in values):
+                return None
+            if any(v is None for v in values):
+                raise NotImplementedError(
+                    f"Layer {layer_name}: state indices are None on "
+                    f"some dp_ranks and non-None on others; batched "
+                    f"forward requires uniform None-ness.")
+            return torch.cat([
+                # step 1+2: physical_local = N // bpb,
+                #          physical_global = physical_local * dp_size + k
+                # step 3: back to logical id
+                #         = physical_global * bpb + (N % bpb)
+                ((v // bpb) * dp_size + per_dp_offsets[k]) * bpb
+                + (v % bpb)
+                for v, k in zip(values, batched_dp_ranks)
+            ])
+        merged_spec_state_indices_tensor = _remap_state_indices(
+            lambda md: md.spec_state_indices_tensor)
+        merged_non_spec_state_indices_tensor = _remap_state_indices(
+            lambda md: md.non_spec_state_indices_tensor)
+
+        # D. token indices (cat + prior_token_count offset).
+        # ``spec_token_indx`` indexes into the merged query tensor
+        # (which is the concatenation of each dp_rank's input_ids
+        # / inputs_embeds). The prior-token-count is the sum of
+        # ``num_tokens`` for all preceding dp_ranks.
+        #
+        # The dp_rank's ``spec_token_indx`` itself is the index
+        # *within* that dp_rank's query subset; we shift it by the
+        # cumulative query-token count before concatenation.
+        prior_token_count = 0
+        spec_token_indx_parts = []
+        non_spec_token_indx_parts = []
+        for b in bundles:
+            md = _layer_md(b)
+            if md.spec_token_indx is not None:
+                spec_token_indx_parts.append(
+                    md.spec_token_indx + prior_token_count)
+            if md.non_spec_token_indx is not None:
+                non_spec_token_indx_parts.append(
+                    md.non_spec_token_indx + prior_token_count)
+            # ``num_actual_tokens`` is the per-dp_rank actual (non-padded)
+            # token count for this batch — advances by exactly that
+            # many positions in the merged query tensor.
+            prior_token_count += md.num_actual_tokens
+        merged_spec_token_indx = (
+            torch.cat(spec_token_indx_parts)
+            if spec_token_indx_parts else None
+        )
+        merged_non_spec_token_indx = (
+            torch.cat(non_spec_token_indx_parts)
+            if non_spec_token_indx_parts else None
+        )
+
+        # C. cu_seqlen-style (cumsum concat with prior offset).
+        # ``spec_query_start_loc[k+1] - spec_query_start_loc[k]``
+        # = the spec-token count of the k-th spec request.
+        # We accumulate per-dp_rank: each dp_rank's local
+        # ``spec_query_start_loc[1:n_spec_decodes_k+1]`` is shifted
+        # by the cumulative spec-token count of all preceding
+        # dp_ranks.
+        prior_spec_count = 0
+        spec_qsl_parts = []
+        for b in bundles:
+            md = _layer_md(b)
+            if md.spec_query_start_loc is None:
+                continue
+            n = md.num_spec_decodes
+            if n > 0:
+                local = md.spec_query_start_loc[1:n + 1]
+                spec_qsl_parts.append(local + prior_spec_count)
+                prior_spec_count += int(md.spec_query_start_loc[n].item())
+        if spec_qsl_parts or any(_layer_md(b).spec_query_start_loc
+                                 is None for b in bundles):
+            # Prepend 0 (cu_seqlen starts at 0).
+            merged_spec_query_start_loc = (
+                torch.cat([torch.zeros(1,
+                                       dtype=torch.int32,
+                                       device=self.device)] +
+                          spec_qsl_parts)
+                if spec_qsl_parts else None
+            )
+        else:
+            merged_spec_query_start_loc = None
+
+        # Same logic for ``non_spec_query_start_loc`` — cumsum of
+        # non-spec counts.
+        prior_non_spec_count = 0
+        non_spec_qsl_parts = []
+        for b in bundles:
+            md = _layer_md(b)
+            if md.non_spec_query_start_loc is None:
+                continue
+            n = md.num_decodes + md.num_prefills
+            if n > 0:
+                local = md.non_spec_query_start_loc[1:n + 1]
+                non_spec_qsl_parts.append(local + prior_non_spec_count)
+                prior_non_spec_count += int(
+                    md.non_spec_query_start_loc[n].item())
+        merged_non_spec_query_start_loc = (
+            torch.cat([torch.zeros(1,
+                                   dtype=torch.int32,
+                                   device=self.device)] +
+                      non_spec_qsl_parts)
+            if non_spec_qsl_parts else None
+        )
+
+        # F. ``chunk_indices`` / ``chunk_offsets`` /
+        # ``nums_dict`` / ``batch_ptr`` /
+        # ``token_chunk_offset_ptr`` — same derivation as
+        # ``_ORIGINAL_BUILD`` (gdn_attn.py line 329-346) but on the
+        # merged ``non_spec_query_start_loc``. These tensors live on
+        # the metadata itself (NOT used by the patched Ascend
+        # forward path — see ``GDNPrefillFallbackMeta`` below) but
+        # are populated to match ``_ORIGINAL_BUILD``'s signature.
+        merged_chunk_indices = None
+        merged_chunk_offsets = None
+        merged_nums_dict = None
+        merged_batch_ptr = None
+        merged_token_chunk_offset_ptr = None
+        # ``GDNPrefillFallbackMeta`` is what ``_patched_build``
+        # additionally sets on the metadata after ``_ORIGINAL_BUILD``
+        # (see patch_gdn_attn.py line 592). Construct it from the
+        # patched helpers, using the merged cu_seqlen.
+        merged_non_spec_prefill_fallback_meta = None
+        if (merged_non_spec_query_start_loc is not None
+                and merged_num_prefills > 0):
+            from vllm.model_executor.layers.fla.ops.index import (
+                prepare_chunk_indices,
+                prepare_chunk_offsets,
+            )
+            from vllm.model_executor.layers.fla.ops.utils import (
+                FLA_CHUNK_SIZE,
+            )
+            from vllm.v1.attention.backends.utils import (
+                compute_causal_conv1d_metadata,
+            )
+            from vllm_ascend.patch.worker.patch_gdn_attn import (
+                GDNPrefillFallbackMeta,
+                _build_non_spec_causal_conv1d_host_meta,
+                _build_non_spec_chunked_prefill_meta,
+                _ensure_causal_conv1d_host_meta_state,
+                _ensure_chunk_meta_state,
+            )
+            # Find the builder for this GDN layer (must be the
+            # same builder that ``_patched_build`` operates on).
+            builder = None
+            for attn_group_list in self.attn_groups:
+                for attn_group in attn_group_list:
+                    if layer_name in attn_group.layer_names:
+                        builder = attn_group.get_metadata_builder(0)
+                        break
+                if builder is not None:
+                    break
+            assert builder is not None, (
+                f"GDN builder not found for layer {layer_name!r}")
+            _ensure_chunk_meta_state(builder, self.device)
+            _ensure_causal_conv1d_host_meta_state(
+                builder, self.device)
+
+            # F-class (chunk_indices / chunk_offsets /
+            # nums_dict / batch_ptr /
+            # token_chunk_offset_ptr) — same as
+            # ``_ORIGINAL_BUILD`` (gdn_attn.py line 329-346) but
+            # on the merged ``non_spec_query_start_loc``.
+            cpu_qsl = merged_non_spec_query_start_loc.cpu()
+            merged_chunk_indices = prepare_chunk_indices(
+                cpu_qsl, FLA_CHUNK_SIZE).to(
+                    device=self.device, non_blocking=True)
+            merged_chunk_offsets = prepare_chunk_offsets(
+                cpu_qsl, FLA_CHUNK_SIZE).to(
+                    device=self.device, non_blocking=True)
+            (merged_nums_dict, merged_batch_ptr,
+             merged_token_chunk_offset_ptr) = (
+                compute_causal_conv1d_metadata(
+                    cpu_qsl, device=self.device))
+
+            # ``GDNPrefillFallbackMeta`` — built by patched
+            # helpers on the merged cu_seqlen.
+            temp_attn_metadata = GDNAttentionMetadata(
+                num_prefills=merged_num_prefills,
+                num_prefill_tokens=merged_num_prefill_tokens,
+                num_decodes=merged_num_decodes,
+                num_decode_tokens=merged_num_decode_tokens,
+                num_spec_decodes=merged_num_spec_decodes,
+                num_spec_decode_tokens=merged_num_spec_decode_tokens,
+                num_actual_tokens=merged_num_actual_tokens,
+                has_initial_state=merged_has_initial_state,
+                spec_query_start_loc=merged_spec_query_start_loc,
+                non_spec_query_start_loc=merged_non_spec_query_start_loc,
+                spec_state_indices_tensor=merged_spec_state_indices_tensor,
+                non_spec_state_indices_tensor=
+                    merged_non_spec_state_indices_tensor,
+                spec_sequence_masks=merged_spec_sequence_masks,
+                spec_token_indx=merged_spec_token_indx,
+                non_spec_token_indx=merged_non_spec_token_indx,
+                num_accepted_tokens=merged_num_accepted_tokens,
+            )
+            merged_causal_conv1d = (
+                _build_non_spec_causal_conv1d_host_meta(
+                    builder, temp_attn_metadata, cpu_qsl))
+            merged_chunk = _build_non_spec_chunked_prefill_meta(
+                builder, cpu_qsl, merged_non_spec_query_start_loc)
+            merged_non_spec_prefill_fallback_meta = GDNPrefillFallbackMeta(
+                causal_conv1d=merged_causal_conv1d,
+                chunk=merged_chunk,
+            )
+
+        attn_metadata = GDNAttentionMetadata(
+            num_prefills=merged_num_prefills,
+            num_prefill_tokens=merged_num_prefill_tokens,
+            num_decodes=merged_num_decodes,
+            num_decode_tokens=merged_num_decode_tokens,
+            num_spec_decodes=merged_num_spec_decodes,
+            num_spec_decode_tokens=merged_num_spec_decode_tokens,
+            num_actual_tokens=merged_num_actual_tokens,
+            has_initial_state=merged_has_initial_state,
+            spec_query_start_loc=merged_spec_query_start_loc,
+            non_spec_query_start_loc=merged_non_spec_query_start_loc,
+            spec_state_indices_tensor=merged_spec_state_indices_tensor,
+            non_spec_state_indices_tensor=merged_non_spec_state_indices_tensor,
+            spec_sequence_masks=merged_spec_sequence_masks,
+            spec_token_indx=merged_spec_token_indx,
+            non_spec_token_indx=merged_non_spec_token_indx,
+            num_accepted_tokens=merged_num_accepted_tokens,
+            chunk_indices=merged_chunk_indices,
+            chunk_offsets=merged_chunk_offsets,
+            nums_dict=merged_nums_dict,
+            batch_ptr=merged_batch_ptr,
+            token_chunk_offset_ptr=merged_token_chunk_offset_ptr,
+        )
+        # ``non_spec_prefill_fallback_meta`` and
+        # ``skip_graph_params_update`` are NOT dataclass fields —
+        # ``_patched_build`` sets them as instance attributes after
+        # construction (see patch_gdn_attn.py line 573/592). Mirror
+        # that for the merged batch.
+        attn_metadata.non_spec_prefill_fallback_meta = (
+            merged_non_spec_prefill_fallback_meta)
+        attn_metadata.skip_graph_params_update = True
+        return attn_metadata
 
     def _reshape_kv_cache_tensors(
         self,
