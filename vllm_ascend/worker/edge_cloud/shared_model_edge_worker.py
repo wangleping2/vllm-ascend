@@ -18,7 +18,7 @@ Key invariants:
   the heavy one-shot initialisation (device init, distributed init,
   workspace, model load, NPU graph capture). Followers (the rest) reuse
   the leader's process-level state and bind to the leader's model
-  through :meth:`NPUModelRunner.bind_to_shared_model`.
+  through :meth:`BatchedModelRunner.bind_to_shared_model`.
 - All virtual workers participate in PP communication at runtime.
   ``local_rank == k`` routes its PP messages to the cloud first-worker
   for DP-rank ``k``.
@@ -69,7 +69,7 @@ from vllm_ascend.distributed.parallel_state import (
 from vllm_ascend.worker.edge_cloud.execute_model_bundle import (
     _ExecuteModelBundle,
 )
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.edge_cloud.batched_model_runner import BatchedModelRunner
 from vllm_ascend.worker.worker import NPUWorker, _detect_has_residual
 from vllm_ascend.utils import enable_sp
 
@@ -163,7 +163,7 @@ class DeferredExecutePostprocess(AsyncModelRunnerOutput):
 class _BatchedExecuteMarker(DeferredExecutePostprocess):
     """Marker returned by :meth:`SharedModelEdgeWorker.execute_model_batched_pre`
     carrying the per-dp_rank :class:`_ExecuteModelBundle` produced by
-    ``NPUModelRunner.execute_model_pre``, plus a back-reference to the
+    ``BatchedModelRunner.execute_model_pre``, plus a back-reference to the
     :class:`SharedModelEdgeWorker` that produced it.
 
     The shared model ``worker_busy_loop`` intercepts this via
@@ -182,7 +182,7 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
       per-dp_rank intermediates from the recv closures, run 1× batched
       tail forward + 1× ``compute_logits`` on the leader runner, slice
       the merged sample hidden states / logits back to per-dp_rank and
-      call :meth:`NPUModelRunner.execute_model_post_batched` on each
+      call :meth:`BatchedModelRunner.execute_model_post_batched` on each
       worker's model_runner. Then per-dp_rank ``on_dp_rank_output(k, None)``
       is invoked to signal the engine that ``sample_tokens`` can run.
 
@@ -354,7 +354,7 @@ class _BatchedExecuteMarker(DeferredExecutePostprocess):
         batched tail ``_model_forward`` + ``compute_logits`` runs on
         the leader runner. The merged sample hidden states / logits
         are sliced back to per-dp_rank and
-        :meth:`NPUModelRunner.execute_model_post_batched` is called
+        :meth:`BatchedModelRunner.execute_model_post_batched` is called
         on each worker's model_runner. Finally
         ``on_dp_rank_output(k, None)`` is invoked for each dp_rank so
         the engine knows to dispatch the independent
@@ -501,9 +501,9 @@ class SharedModelEdgeWorker(NPUWorker):
     pool. To allow a single batched forward to address the union of all
     dp_rank KV blocks (one global buffer):
 
-    1. Each worker's ``NPUModelRunner.initialize_kv_cache`` registers
+    1. Each worker's ``BatchedModelRunner.initialize_kv_cache`` registers
        its ``KVCacheConfig`` in the class-level
-       :attr:`NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[dp_rank]`.
+       :attr:`BatchedModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[dp_rank]`.
     2. The LAST worker to enter ``initialize_kv_cache`` detects
        ``len(...) == data_parallel_size`` and invokes
        :meth:`allocate_global_kv_cache_tensors` once to build a global
@@ -515,7 +515,7 @@ class SharedModelEdgeWorker(NPUWorker):
     The "last caller" is whichever dp_rank worker happens to be the
     final one to register; it does NOT have to be the leader.
 
-    Note: the sync state lives on ``NPUModelRunner`` (not on
+    Note: the sync state lives on ``BatchedModelRunner`` (not on
     ``SharedModelEdgeWorker``) because it conceptually belongs to the
     model runner — the worker class doesn't need to know about
     ``KVCacheConfig`` or the construction protocol.
@@ -578,13 +578,13 @@ class SharedModelEdgeWorker(NPUWorker):
     # --------------------------------------------------------- init_device
     def init_device(self) -> None:
         """Set up the NPU device and (for all virtual workers) the
-        :class:`NPUModelRunner`.
+        :class:`BatchedModelRunner`.
 
         The leader runs the full one-shot initialisation (device set,
         memory snapshot, distributed init, workspace). Followers reuse
         the leader's ``self.device`` and skip those steps because they
         are process-wide; they only construct their own
-        :class:`NPUModelRunner`. The shared model is bound later in
+        :class:`BatchedModelRunner`. The shared model is bound later in
         :meth:`load_model`.
         """
         if self._is_leader:
@@ -607,15 +607,11 @@ class SharedModelEdgeWorker(NPUWorker):
             self.requested_memory = leader.requested_memory
 
         # All virtual workers construct their own model_runner; the
-        # shared model is bound later in load_model. NPUModelRunner's
+        # shared model is bound later in load_model. BatchedModelRunner's
         # constructor does not depend on the model object.
         if self.use_v2_model_runner:
-            from vllm_ascend.worker.v2.model_runner import (
-                NPUModelRunner as NPUModelRunnerV2,
-            )
-            self.model_runner = NPUModelRunnerV2(self.vllm_config, self.device)
-        else:
-            self.model_runner = NPUModelRunner(self.vllm_config, self.device)
+            logger.info("v2 is not supported for SharedModelEdgeWorker")
+        self.model_runner = BatchedModelRunner(self.vllm_config, self.device)
         
         if self._is_leader:
             # Initialize edge-cloud tensor metadata for optimized communication
@@ -820,7 +816,7 @@ class SharedModelEdgeWorker(NPUWorker):
 
         Behaviour:
         - Drain any in-flight ``_pp_send_work`` and step the profiler.
-        - Call :meth:`NPUModelRunner.execute_model_pre` to update
+        - Call :meth:`BatchedModelRunner.execute_model_pre` to update
           ``self.input_batch`` and obtain an
           :class:`_ExecuteModelBundle`.
         - For empty / no-work cases ``execute_model_pre`` returns
@@ -830,7 +826,7 @@ class SharedModelEdgeWorker(NPUWorker):
         - Otherwise return a :class:`_BatchedExecuteMarker` carrying the
           bundle; the busy_loop intercepts it and orchestrates the
           batched head / tail / per-dp_rank post via
-          ``NPUModelRunner.execute_model_batched_head`` /
+          ``BatchedModelRunner.execute_model_batched_head`` /
           ``_tail`` / ``_post_batched``.
         """
         from vllm_ascend import envs as envs_ascend
@@ -1031,12 +1027,12 @@ class SharedModelEdgeWorker(NPUWorker):
         # for every virtual worker on the edge (they all share one
         # NPU and one distributed rank), so it would alias every
         # dp_rank's entry.
-        NPUModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[self.local_rank] = (
+        BatchedModelRunner._KV_CACHE_CONFIGS_PER_DP_RANK[self.local_rank] = (
             kv_cache_config
         )
         with context:
             self.model_runner.initialize_kv_cache(kv_cache_config)
-            if NPUModelRunner._KV_CACHE_CONSTRUCTED:
+            if BatchedModelRunner._KV_CACHE_CONSTRUCTED:
                 for w in _SHARED_MODEL_REGISTRY:
                     # Mirror shared last-caller state onto every
                     # follower's model_runner. Followers will use
