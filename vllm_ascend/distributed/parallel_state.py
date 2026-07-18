@@ -1385,7 +1385,7 @@ def edge_cloud_broadcast_recv(
     return recv_tensor_dict, [], [broadcast_postprocess]
 
 
-def edge_cloud_broadcast_recv_draft() -> tuple[
+def edge_cloud_broadcast_recv_draft(src: int | None = None) -> tuple[
     dict[str, torch.Tensor | Any] | None,
     list[Handle],
     list[Callable[[], None]],
@@ -1407,10 +1407,10 @@ def edge_cloud_broadcast_recv_draft() -> tuple[
     """
     pp_group = get_pp_group()
     tp_group = get_tp_group()
-    is_pp_npu0 = pp_group.world_size == 2
+    is_pp_npu0 = pp_group.world_size > 1
 
     if is_pp_npu0:
-        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict()
+        tensor_dict, comm_handles, comm_postprocess = pp_group.irecv_tensor_dict(src=src)
         assert tensor_dict is not None, (
             "edge_cloud_broadcast_recv_draft: PP tensor_dict is None, "
             "sender may have failed."
