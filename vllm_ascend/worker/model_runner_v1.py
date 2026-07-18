@@ -3031,9 +3031,9 @@ class NPUModelRunner(GPUModelRunner):
                     and self._last_scheduler_output is not None
                 ):
                     pp_group = get_pp_group()
-                    if pp_group.world_size == 2:
+                    if pp_group.world_size > 1:
                         tensor_dict, recv_handles, recv_postprocess = (
-                            pp_group.irecv_tensor_dict()
+                            pp_group.irecv_tensor_dict(src=0)
                         )
                         for handle in recv_handles:
                             handle.wait()
@@ -3223,8 +3223,9 @@ class NPUModelRunner(GPUModelRunner):
                     tensor_dict_to_send["valid_sampled_token_count"] = (
                         self.valid_sampled_token_count_gpu.cpu()
                     )
-                if get_pp_group().world_size == 2:
-                    send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send)
+                if get_pp_group().world_size > 1:
+                    send_work = get_pp_group().isend_tensor_dict(tensor_dict_to_send,
+                        dst=getattr(self, 'local_rank', 0) + 1)
                     for handle in send_work:
                         handle.wait()
 
@@ -3489,7 +3490,7 @@ class NPUModelRunner(GPUModelRunner):
         for _ in range(num_steps):
             # Receive intermediate from edge (including positions and spec_step_idx)
             tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft()
+                edge_cloud_broadcast_recv_draft(src=0)
             )
             for handle in comm_handles:
                 handle.wait()
@@ -3580,10 +3581,10 @@ class NPUModelRunner(GPUModelRunner):
             assert isinstance(output, IntermediateTensors)
 
             # Send back to edge
-            if get_pp_group().world_size == 2:
+            if get_pp_group().world_size > 1:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}
+                     for k, v in output.items()}, dst=0
                 )
                 for handle in send_work:
                     handle.wait()
