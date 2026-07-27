@@ -3515,8 +3515,26 @@ class NPUModelRunner(GPUModelRunner):
             if self.speculative_config else 1
         )
 
-        for _ in range(num_steps):
-            # Receive intermediate from edge (including positions and spec_step_idx)
+        # Cross-DP sync: the cloud DP group must agree on
+        # ``num_tokens`` so the drafter's forward context
+        # (``max_tokens_across_dp``, ``padded_length``,
+        # ``mc2_mask``) stays in lockstep with the main model.
+        # The drafter's own ``_propose`` takes the FIRST
+        # return value of ``_sync_metadata_across_dp`` (the
+        # dp-group max for drafter) and uses it as
+        # ``num_input_tokens`` (line 717) — we follow the
+        # same convention here. First two rounds run a fresh
+        # all_reduce; rounds 3+ reuse the round-2 result.
+        synced_num_tokens: int | None = None
+        synced_num_tokens_across_dp: torch.Tensor | None = None
+        synced_cudagraph_mode: CUDAGraphMode | None = None
+
+        for round_idx in range(num_steps):
+            # Receive intermediate from edge first — the per-dp
+            # value from the edge's broadcast is the per-rank
+            # input to the cross-DP ``dist.all_reduce``. Doing
+            # the recv first means we feed the sync with the
+            # real per-dp value rather than a placeholder.
             tensor_dict, comm_handles, comm_postprocess = (
                 edge_cloud_broadcast_recv_draft(src=0)
             )
@@ -3526,9 +3544,39 @@ class NPUModelRunner(GPUModelRunner):
                 postprocess()
             intermediate = IntermediateTensors(tensor_dict)
 
-            # Build kwargs for cloud segment
+            # Per-dp_rank value from the edge broadcast — the
+            # per-rank input to ``_sync_metadata_across_dp``
+            # and the source for the drafter's positions
+            # buffer (the canonical owner). Determined AFTER
+            # the recv so the sync has the real per-dp value.
             positions = intermediate.tensors.get("positions", None)
-            num_tokens = positions.shape[-1] if positions is not None else 0
+            per_dp_num_tokens = (
+                positions.shape[-1] if positions is not None else 0
+            )
+
+            if round_idx < 2 or synced_num_tokens is None:
+                (
+                    synced_num_tokens,
+                    synced_num_tokens_across_dp,
+                    synced_cudagraph_mode,
+                ) = self._sync_metadata_across_dp(
+                    per_dp_num_tokens,
+                    is_draft_model=True,
+                    cudagraph_mode=CUDAGraphMode.NONE,
+                )
+
+            # Write the per-dp_rank value into the drafter's
+            # positions buffer (the canonical owner) so the
+            # segment sees a stable buffer address, then read
+            # it back at the dp-group-max length for
+            # ``_build_mtp_cloud_attn_metadata`` and
+            # ``model_kwargs``. A single get on the drafter's
+            # buffer keeps ACLGraph capture/replay happy
+            # without leaking the per-dp_recv'd tensor
+            # address into the segment.
+            self.drafter._set_positions(per_dp_num_tokens, positions)
+            num_tokens = synced_num_tokens
+            positions = self.drafter._get_positions(num_tokens)
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
@@ -3538,7 +3586,6 @@ class NPUModelRunner(GPUModelRunner):
 
             # Run cloud segment (all draft decoder layers are on cloud)
             segment = self._edge_cloud_draft_segments["c"]
-            num_tokens = positions.shape[-1] if positions is not None else 0
 
             model_kwargs = {
                 "intermediate_tensors": intermediate,
@@ -3581,7 +3628,7 @@ class NPUModelRunner(GPUModelRunner):
 
             # Determine cudagraph runtime mode for the draft cloud segment so
             # that ACLGraphWrapper can replay a captured graph during decode.
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
+            cudagraph_runtime_mode = synced_cudagraph_mode
             batch_descriptor = BatchDescriptor(num_tokens)
             # if (
             #     self.edge_cloud_cfg.enable_decode_graph
@@ -3600,6 +3647,7 @@ class NPUModelRunner(GPUModelRunner):
                 attn_metadata=draft_attn_metadata,
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
+                num_tokens_across_dp=synced_num_tokens_across_dp,
                 num_actual_tokens=num_tokens,
                 batch_descriptor=batch_descriptor,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
@@ -3616,6 +3664,120 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 for handle in send_work:
                     handle.wait()
+
+    def _run_draft_cloud_dummy_companion(
+        self,
+        num_tokens: int,
+    ) -> None:
+        """Companion sync + local forward for the drafter's
+        ``dummy_run`` on the cloud side of an edge-cloud drafter
+        (mtp/eagle3).
+
+        Mirrors :meth:`_run_draft_cloud_segment` round-by-round — the
+        same ``num_speculative_tokens``-iteration loop — but skips
+        every step that needs a paired edge peer: ``edge_cloud_broadcast_recv_draft``
+        (no recv, dummy_run has no edge partner to send) and
+        ``isend_tensor_dict`` (no return target). The cloud draft
+        segment ``segments["c"]`` IS run per round so the drafter
+        participates in the actual capture/replay cycle (the
+        ``ACLGraphWrapper`` wrapping ``segments["c"]`` needs at
+        least one replay to register the captured graph).
+
+        The cross-DP sync via :meth:`_sync_metadata_across_dp` is
+        folded into the per-round ``set_ascend_forward_context``
+        (the same way the drafter's own ``dummy_run`` does it
+        in :class:`AscendSpecDecodeBaseProposer`); runs on the
+        first two rounds, and from round 3 onwards the round-2
+        return values are reused so the drafter doesn't
+        re-trigger the all_reduce for every extra spec step.
+
+        ``cudagraph_runtime_mode`` is hard-coded to
+        :attr:`CUDAGraphMode.NONE` because the companion never
+        actually captures or replays a graph; the all_reduce still
+        propagates the synced mode for downstream consumers that
+        read it from ``forward_context``. The ``BatchDescriptor``
+        is built locally per round from the synced num_tokens for
+        the same reason — there is no caller-supplied descriptor
+        to forward.
+        """
+        from vllm.sequence import IntermediateTensors
+
+        num_steps = (
+            self.speculative_config.num_speculative_tokens
+            if self.speculative_config else 1
+        )
+
+        # Cache the first two rounds of ``_sync_metadata_across_dp``
+        # so subsequent rounds can reuse the result without
+        # re-triggering the cross-DP ``dist.all_reduce``.
+        synced_num_tokens: int | None = None
+        synced_num_tokens_across_dp: torch.Tensor | None = None
+        synced_cudagraph_mode: CUDAGraphMode | None = None
+
+        for round_idx in range(num_steps):
+            # Cross-DP sync: the actual "陪跑" — the drafter ranks
+            # join the same all_reduce as the main model so
+            # ``num_tokens`` is agreed across the cloud DP group.
+            # First two rounds run a fresh all_reduce; rounds 3+
+            # reuse the round-2 result.
+            if round_idx < 2 or synced_num_tokens is None:
+                (
+                    synced_num_tokens,
+                    synced_num_tokens_across_dp,
+                    synced_cudagraph_mode,
+                ) = self._sync_metadata_across_dp(
+                    num_tokens,
+                    is_draft_model=True,
+                    cudagraph_mode=CUDAGraphMode.NONE,
+                )
+
+            buffers = self._edge_cloud_draft_intermediate_buffers
+            if buffers is None:
+                raise RuntimeError(
+                    "_edge_cloud_draft_intermediate_buffers not "
+                    "initialised; cannot run drafter cloud "
+                    "dummy_run companion without persistent "
+                    "intermediate buffers.")
+
+            intermediate = IntermediateTensors(
+                {k: v[:synced_num_tokens] for k, v in buffers.items()}
+            )
+
+            # ``positions`` is read from the drafter's positions
+            # buffer via ``_get_positions`` sized to
+            # ``synced_num_tokens`` so the per-rank length
+            # matches the ``intermediate`` slice.
+            positions = self.drafter._get_positions(synced_num_tokens)
+
+            segment = self._edge_cloud_draft_segments["c"]
+            model_kwargs = {
+                "intermediate_tensors": intermediate,
+                "positions": positions,
+            }
+            spec_step_idx = round_idx
+            draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
+                positions, spec_step_idx
+            )
+
+            with set_ascend_forward_context(
+                attn_metadata=draft_attn_metadata,
+                vllm_config=self.vllm_config,
+                num_tokens=synced_num_tokens,
+                num_tokens_across_dp=synced_num_tokens_across_dp,
+                num_actual_tokens=0,
+                aclgraph_runtime_mode=synced_cudagraph_mode,
+                batch_descriptor=BatchDescriptor(synced_num_tokens),
+                is_draft_model=True,
+            ):
+                # Run the cloud draft segment per round so the
+                # ``ACLGraphWrapper`` wrapping it captures /
+                # replays the graph. The forward itself is
+                # against the persistent-buffer placeholder
+                # intermediate (no real edge input), which is
+                # exactly what ``_run_draft_edge_cloud``'s
+                # dummy_run branch does on the drafter's edge
+                # side.
+                _ = segment(**model_kwargs)
 
     # overwrite _sample for lmhead_tp_enable and need_accepted_tokens
     def _sample(self, logits, spec_decode_metadata):

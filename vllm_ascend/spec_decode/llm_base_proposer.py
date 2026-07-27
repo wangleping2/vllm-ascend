@@ -457,11 +457,42 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         dummy_compute_logits=lambda hidden_states: None,
         is_profile=False,
     ):
+        is_cloud_draft = (
+            self.method in ("mtp", "eagle3")
+            and self.runner is not None
+            and getattr(self.runner, "_edge_cloud_enabled", False)
+            and self.runner.edge_cloud_cfg.role == "cloud"
+        )
+        # dummy_run on the cloud side of an edge-cloud drafter
+        # delegates entirely to the runner's
+        # ``_run_draft_cloud_dummy_companion`` which mirrors
+        # ``_run_draft_cloud_segment``'s per-step structure: it
+        # loops ``num_speculative_tokens`` times, each
+        # iteration doing the cross-DP sync via
+        # ``_sync_metadata_across_dp`` (the drafter's own
+        # companion, so the cloud DP group's all_reduce is
+        # actually triggered and agrees with the main model)
+        # and entering ``set_ascend_forward_context`` so the
+        # drafter's forward context
+        # (``max_tokens_across_dp``, ``padded_length``,
+        # ``mc2_mask``) stays in lockstep with the main model.
+        # The PP recv / isend / full segment forward are
+        # skipped — dummy_run has no edge peer to recv from,
+        # and the companion just runs ``segments["c"]``
+        # against the persistent-buffer placeholder
+        # intermediate for ACLGraph capture/replay.
+        if is_cloud_draft:
+            self.runner._run_draft_cloud_dummy_companion(
+                num_tokens=num_tokens,
+            )
+            return
+
         (
             num_tokens,
             num_tokens_across_dp,
             _,
-        ) = self.runner._sync_metadata_across_dp(num_tokens, is_draft_model=True)
+        ) = self.runner._sync_metadata_across_dp(
+            num_tokens, is_draft_model=True)
 
         multi_steps_attn_metadata = []
         if not self.use_cuda_graph:
@@ -552,17 +583,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if is_profile:
             batch_size = min(batch_size, self.runner.max_num_reqs)
 
-        # On the cloud side of edge-cloud draft (MTP/Eagle3), the draft model's
-        # embed_tokens is replaced with PPMissingLayer, so embed_input_ids would
-        # return the raw 1D input_ids instead of 2D embeddings. The cloud side
-        # does not need inputs_embeds anyway — it receives intermediate tensors
-        # from the edge via broadcast.
-        is_cloud_draft = (
-            self.method in ("mtp", "eagle3")
-            and self.runner is not None
-            and getattr(self.runner, "_edge_cloud_enabled", False)
-            and self.runner.edge_cloud_cfg.role == "cloud"
-        )
         if self.supports_mm_inputs and not is_cloud_draft:
             mm_embeds, is_mm_embed = (None, None)
             inputs_embeds = self.model.embed_input_ids(
@@ -573,6 +593,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             inputs_embeds = None
 
+        # dummy_run needs the forward context so the inner
+        # ``_runnable`` (``_run_merged_draft``) has access to it
+        # for things like ``_update_full_graph_params``. The
+        # cross-DP sync happened earlier at the top of
+        # ``dummy_run`` (or via the cloud-draft companion
+        # branch), so this context just sets the per-step
+        # attn metadata and ACL graph state.
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
@@ -599,6 +626,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 inputs_embeds=inputs_embeds,
                 multi_steps_attn_metadata=multi_steps_attn_metadata,
                 num_tokens=num_tokens,
+                is_dummy=True,
             )
             forward_context = get_forward_context()
             if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not _EXTRA_CTX.capturing:
@@ -998,6 +1026,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         multi_steps_attn_metadata,
         num_tokens,
         is_prefill=None,
+        is_dummy=False,
     ) -> torch.Tensor:
         # The lifecycle of `input_ids`, `positions`, `hidden_states` runs through all
         # speculative tokens' proposings. `model_input_ids`, `model_positions` and
@@ -1026,6 +1055,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             and self.runner is not None
             and getattr(self.runner, "_edge_cloud_enabled", False)
         ):
+            # dummy_run never pairs with a peer; skip PP comm and let the
+            # edge-cloud drafter drive head+tail purely from local buffers.
+            model_kwargs["dummy_run"] = is_dummy
             ret_hidden_states = self._run_draft_edge_cloud(**model_kwargs)
             if self.runner.edge_cloud_cfg.role == "cloud":
                 # When num_speculative_tokens > 1, the edge side iterates
@@ -1038,7 +1070,18 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         # The cloud path populates intermediate_tensors,
                         # positions, and spec_step_idx from the received
                         # tensor_dict; pass placeholders for keys it will pop.
-                        cloud_kwargs: dict[str, Any] = {}
+                        # ``dummy_run`` is re-applied each round so the
+                        # short-circuit branch fires on every iteration
+                        # even though ``cloud_kwargs`` is rebuilt.
+                        # ``positions`` is supplied here so the dummy_run
+                        # branch in ``_run_draft_edge_cloud`` can derive
+                        # ``num_tokens`` (positions advance by 1 per
+                        # draft_step on the edge side, so we replicate
+                        # that here).
+                        cloud_kwargs: dict[str, Any] = {
+                            "dummy_run": is_dummy,
+                            "positions": model_positions + draft_step + 1,
+                        }
                         if self.pass_hidden_states_to_model:
                             cloud_kwargs["input_ids"] = None
                             cloud_kwargs["hidden_states"] = None
@@ -1234,6 +1277,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 # draft_step + 1 because the first draft token was already
                 # generated in the first pass.
                 model_kwargs["spec_step_idx"] = draft_step + 1
+                # Re-fill ``dummy_run`` from the function's ``is_dummy``
+                # parameter so the for loop's per-round call to
+                # ``_run_draft_edge_cloud`` propagates the flag
+                # consistently with the first call (which sets it
+                # directly on ``model_kwargs`` before this loop runs).
+                model_kwargs["dummy_run"] = is_dummy
                 ret_hidden_states = self._run_draft_edge_cloud(**model_kwargs)
                 if self.runner.edge_cloud_cfg.role == "cloud":
                     # Cloud has already sent hidden states back to edge;
@@ -2080,6 +2129,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
     def _run_draft_edge_cloud(self, **model_kwargs) -> torch.Tensor:
         segments = self.runner._edge_cloud_draft_segments
         role = self.runner.edge_cloud_cfg.role
+        # `dummy_run` is consumed here: the dummy_run path never pairs with a
+        # peer cloud forward, so it must skip the PP isend/irecv pair. The
+        # caller (`_run_merged_draft`) is the only source of this flag — it
+        # propagates through `model_kwargs` so the existing ACLGraphWrapper
+        # / segment call sites stay unchanged.
+        is_dummy_run = model_kwargs.pop("dummy_run", False)
 
         if role == "edge":
             # Edge first segment: embed only for Eagle3 (fusion happens on the
@@ -2110,23 +2165,46 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output["spec_step_idx"] = torch.tensor(
                     0, dtype=torch.int64, device="cpu"
                 )
-            if get_pp_group().world_size > 1:
-                send_work = get_pp_group().isend_tensor_dict(
-                    {k: v.contiguous() if isinstance(v, torch.Tensor) else v
-                     for k, v in output.items()}, dst=self.local_rank + 1
-                )
-                for handle in send_work:
-                    handle.wait()
 
-            # Receive cloud segment result (all decoder layers run on cloud)
-            tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft(src=self.local_rank + 1)
-            )
-            for handle in comm_handles:
-                handle.wait()
-            for postprocess in comm_postprocess:
-                postprocess()
-            intermediate = IntermediateTensors(tensor_dict)
+            if is_dummy_run:
+                # dummy_run short-circuits the cloud side: feed segment_e
+                # from the pre-allocated persistent buffer sliced to the
+                # current ``num_tokens`` (same source as the recv path
+                # uses via ``_sync_edge_cloud_draft_intermediate_tensors``
+                # below). No per-call allocation, no PP comm — the buffer
+                # already holds the placeholder state we need.
+                positions = model_kwargs["positions"]
+                num_tokens = positions.shape[-1]
+                buffers = (
+                    self.runner._edge_cloud_draft_intermediate_buffers
+                )
+                if buffers is None:
+                    raise RuntimeError(
+                        "_edge_cloud_draft_intermediate_buffers not "
+                        "initialised; cannot run edge-cloud drafter "
+                        "dummy_run without persistent intermediate "
+                        "buffers.")
+                intermediate = IntermediateTensors(
+                    {k: v[:num_tokens] for k, v in buffers.items()}
+                )
+            else:
+                if get_pp_group().world_size > 1:
+                    send_work = get_pp_group().isend_tensor_dict(
+                        {k: v.contiguous() if isinstance(v, torch.Tensor) else v
+                         for k, v in output.items()}, dst=self.local_rank + 1
+                    )
+                    for handle in send_work:
+                        handle.wait()
+
+                # Receive cloud segment result (all decoder layers run on cloud)
+                tensor_dict, comm_handles, comm_postprocess = (
+                    edge_cloud_broadcast_recv_draft(src=self.local_rank + 1)
+                )
+                for handle in comm_handles:
+                    handle.wait()
+                for postprocess in comm_postprocess:
+                    postprocess()
+                intermediate = IntermediateTensors(tensor_dict)
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_e sees stable input addresses.
@@ -2148,14 +2226,50 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             # Cloud path: this should normally not be reached because cloud
             # sample_tokens returns None before calling _run_merged_draft.
             # Kept here as a fallback if the calling context changes.
-            tensor_dict, comm_handles, comm_postprocess = (
-                edge_cloud_broadcast_recv_draft(src=0)
-            )
-            for handle in comm_handles:
-                handle.wait()
-            for postprocess in comm_postprocess:
-                postprocess()
-            intermediate = IntermediateTensors(tensor_dict)
+            if is_dummy_run:
+                # dummy_run short-circuits the edge side: feed segment_c
+                # from the pre-allocated persistent buffer sliced to the
+                # current ``num_tokens`` (same source as the recv path
+                # uses via ``_sync_edge_cloud_draft_intermediate_tensors``
+                # below). No per-call allocation, no PP recv.
+                positions = model_kwargs.get("positions")
+                num_tokens = (
+                    positions.shape[-1] if positions is not None else 0
+                )
+                buffers = (
+                    self.runner._edge_cloud_draft_intermediate_buffers
+                )
+                if buffers is None:
+                    raise RuntimeError(
+                        "_edge_cloud_draft_intermediate_buffers not "
+                        "initialised; cannot run edge-cloud drafter "
+                        "dummy_run without persistent intermediate "
+                        "buffers.")
+                intermediate = IntermediateTensors(
+                    {k: v[:num_tokens] for k, v in buffers.items()}
+                )
+                spec_step_idx = model_kwargs.get("spec_step_idx", 0)
+                # Provide positions / spec_step_idx via a synthetic
+                # tensor_dict so the downstream recv-shaped reads below
+                # (``tensor_dict.get("positions")`` /
+                # ``tensor_dict["spec_step_idx"]``) work without
+                # branching. The buffer-sliced intermediate replaces
+                # the PP-received one.
+                tensor_dict = {
+                    "positions": positions,
+                    "spec_step_idx": torch.tensor(
+                        spec_step_idx, dtype=torch.int64, device="cpu"
+                    ),
+                }
+            else:
+                tensor_dict, comm_handles, comm_postprocess = (
+                    edge_cloud_broadcast_recv_draft(src=0)
+                )
+                for handle in comm_handles:
+                    handle.wait()
+                for postprocess in comm_postprocess:
+                    postprocess()
+                intermediate = IntermediateTensors(tensor_dict)
 
             # Copy received tensors into persistent buffers so that the
             # ACLGraphWrapper-wrapped segment_c sees stable input addresses.
@@ -2240,7 +2354,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 output = segments["c"](**model_kwargs)
             assert isinstance(output, IntermediateTensors)
 
-            if get_pp_group().world_size > 1:
+            if not is_dummy_run and get_pp_group().world_size > 1:
                 send_work = get_pp_group().isend_tensor_dict(
                     {k: v.contiguous() if isinstance(v, torch.Tensor) else v
                      for k, v in output.items()}, dst=0
