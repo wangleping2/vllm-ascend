@@ -3344,6 +3344,7 @@ class NPUModelRunner(GPUModelRunner):
         self,
         positions: torch.Tensor,
         spec_step_idx: int,
+        num_actual_tokens: int | None = None,
     ) -> dict[str, Any] | None:
         """Build per-layer attention metadata for the draft cloud decoder.
 
@@ -3356,6 +3357,15 @@ class NPUModelRunner(GPUModelRunner):
         Uses the spec_decode_common_attn_metadata saved during
         execute_model() and the drafter's draft_attn_groups to build
         per-layer metadata for each speculative step.
+
+        ``num_actual_tokens`` is the post-pad token count for the
+        cloud's per-dp slice. When ``None`` (the default for the
+        in-graph / normal inference path), it is filled with
+        ``num_input_tokens`` (the dp-group max) so the attention
+        backend sees the same value as the rest of the runner.
+        When a non-None value is supplied (multi-DP + dummy_run
+        companion path), the supplied value is preserved so the
+        dummy_run's per-dp slice is honoured.
         """
         if (
             not hasattr(self, "_cloud_spec_decode_common_attn_metadata")
@@ -3388,7 +3398,8 @@ class NPUModelRunner(GPUModelRunner):
         # Use the actual number of tokens carried by positions,
         # which already accounts for rejected tokens on the edge side.
         num_input_tokens = positions.shape[-1]
-        num_actual_tokens = num_input_tokens
+        if num_actual_tokens is None:
+            num_actual_tokens = num_input_tokens
         common_attn_metadata.num_actual_tokens = num_actual_tokens
         common_attn_metadata.num_input_tokens = num_input_tokens
 
@@ -3483,6 +3494,39 @@ class NPUModelRunner(GPUModelRunner):
             # hidden states and leads to 100% draft-hit dead loops.
             if common_attn_metadata.attn_state is None:
                 common_attn_metadata.attn_state = AscendAttentionState.SpecDecoding
+
+            # Pad ``slot_mapping`` to the current round's length if
+            # it is too short. The cached slot_mapping from the
+            # main model's forward pass may be sized to a
+            # previous round's batch_size or be empty (e.g. the
+            # dummy_run companion path skips execute_model), so
+            # pad it with PADDING_SLOT_ID to match the current
+            # positions length. ``dtype`` and ``device`` are
+            # inferred from the existing slot_mapping tensor so
+            # the padding matches exactly.
+            slot_mapping = common_attn_metadata.slot_mapping
+            if slot_mapping is None or slot_mapping.shape[-1] < num_input_tokens:
+                pad_len = num_input_tokens - (
+                    slot_mapping.shape[-1] if slot_mapping is not None else 0
+                )
+                if slot_mapping is None:
+                    pad = torch.full(
+                        (pad_len,),
+                        PADDING_SLOT_ID,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    common_attn_metadata.slot_mapping = pad
+                else:
+                    pad = torch.full(
+                        (pad_len,),
+                        PADDING_SLOT_ID,
+                        dtype=slot_mapping.dtype,
+                        device=slot_mapping.device,
+                    )
+                    common_attn_metadata.slot_mapping = torch.cat(
+                        [slot_mapping, pad], dim=-1
+                    )
 
         # Build per-layer attention metadata using draft_attn_groups.
         per_layer_attn_metadata: dict[str, Any] = {}
@@ -3623,7 +3667,7 @@ class NPUModelRunner(GPUModelRunner):
             # Without this, the Ascend attention backend silently
             # returns zeros, corrupting hidden states.
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx
+                positions, spec_step_idx, num_actual_tokens=per_dp_num_tokens
             )
 
             # Determine cudagraph runtime mode for the draft cloud segment so
@@ -3648,7 +3692,7 @@ class NPUModelRunner(GPUModelRunner):
                 vllm_config=self.vllm_config,
                 num_tokens=num_tokens,
                 num_tokens_across_dp=synced_num_tokens_across_dp,
-                num_actual_tokens=num_tokens,
+                num_actual_tokens=per_dp_num_tokens,
                 batch_descriptor=batch_descriptor,
                 aclgraph_runtime_mode=cudagraph_runtime_mode,
                 is_draft_model=True,
@@ -3665,6 +3709,13 @@ class NPUModelRunner(GPUModelRunner):
                 for handle in send_work:
                     handle.wait()
 
+        # Clear the cached spec_decode_common_attn_metadata after
+        # the MTP forward runs so the dummy_run companion path
+        # can't read stale per-round state (slot_mapping lengths,
+        # num_actual_tokens, etc.) left over from the last real
+        # inference.
+        self._cloud_spec_decode_common_attn_metadata = None
+
     def _run_draft_cloud_dummy_companion(
         self,
         num_tokens: int,
@@ -3673,7 +3724,7 @@ class NPUModelRunner(GPUModelRunner):
         ``dummy_run`` on the cloud side of an edge-cloud drafter
         (mtp/eagle3).
 
-        Mirrors :meth:`_run_draft_cloud_segment` round-by-round — the
+        Mirrors :method:`_run_draft_cloud_segment` round-by-round — the
         same ``num_speculative_tokens``-iteration loop — but skips
         every step that needs a paired edge peer: ``edge_cloud_broadcast_recv_draft``
         (no recv, dummy_run has no edge partner to send) and
@@ -3699,8 +3750,21 @@ class NPUModelRunner(GPUModelRunner):
         is built locally per round from the synced num_tokens for
         the same reason — there is no caller-supplied descriptor
         to forward.
+
+        Clears ``_cloud_spec_decode_common_attn_metadata`` at the
+        start so the companion reads a fresh state (instead of
+        stale per-round slot_mapping lengths / num_actual_tokens
+        from the last real inference). The per-round cleanup is
+        left to ``_run_draft_cloud_segment`` at the end.
         """
         from vllm.sequence import IntermediateTensors
+
+        # Clear the cached spec_decode_common_attn_metadata at the
+        # start so the dummy_run companion reads a fresh state
+        # instead of stale per-round state (slot_mapping lengths,
+        # num_actual_tokens, etc.) left over from the last real
+        # inference.
+        self._cloud_spec_decode_common_attn_metadata = None
 
         num_steps = (
             self.speculative_config.num_speculative_tokens
@@ -3756,7 +3820,7 @@ class NPUModelRunner(GPUModelRunner):
             }
             spec_step_idx = round_idx
             draft_attn_metadata = self._build_mtp_cloud_attn_metadata(
-                positions, spec_step_idx
+                positions, spec_step_idx, num_actual_tokens=0
             )
 
             with set_ascend_forward_context(
