@@ -324,6 +324,24 @@ class LwdTransferQueue:
                 lwd_get_payload_scrambler().descramble(tensor, seed=seed)
                 done_event = torch.npu.Event()
                 done_event.record()
+        # Host staging (design v7 §4.3): land the payload segment-by-
+        # segment into the per-request pinned buffers on a dedicated D2H
+        # copy stream - the comm thread never blocks on a copy, and the
+        # segments overlap the next recv posted on the channel stream.
+        # Ordered after the (possibly re-recorded post-descramble)
+        # completion event; the staged event recorded behind the last
+        # segment is what the comm thread polls via staged_done().
+        staged_event = None
+        if req.op == "recv" and req.stage_segments is not None:
+            assert tensor is not None, "staged recv requires tensor"
+            copy_stream = self._copy_stream()
+            if done_event is not None:
+                copy_stream.wait_event(done_event)
+            with torch.npu.stream(copy_stream):
+                for dst, src_off, n in req.stage_segments:
+                    dst.copy_(tensor[src_off : src_off + n], non_blocking=True)
+                staged_event = torch.npu.Event()
+                staged_event.record()
         future_request = replace(req, tensor=None) if req.op == "send" else req
         if into is None:
             return LwdTransferFuture(
@@ -333,6 +351,7 @@ class LwdTransferQueue:
                 tensor=tensor,
                 keepalive=keepalive,
                 aux_tensor=aux_tensor,
+                staged_event=staged_event,
             )
         into._bind(
             handles=handles,
@@ -340,11 +359,22 @@ class LwdTransferQueue:
             tensor=tensor,
             keepalive=keepalive,
             aux_tensor=aux_tensor,
+            staged_event=staged_event,
         )
         return into
 
     def _stream(self):
         return lwd_channels.lwd_get_channel_stream(self.channel_type)
+
+    def _copy_stream(self):
+        """Dedicated D2H copy stream for staged receives: the segmented
+        copies run concurrently with the next recv on the channel
+        stream."""
+        stream = getattr(self, "_d2h_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._d2h_copy_stream = stream
+        return stream
 
     def _order_after(self, predecessor: LwdTransferFuture | None) -> None:
         if predecessor is None:
@@ -403,11 +433,25 @@ class LwdTransferQueue:
         )
         # Exact-size buffer: HCCL P2P requires matching numel on both
         # ends; the size is learned from the control-plane notification.
-        # TODO(lwd): confirm two points about this buffer: it is allocated on
-        # the channel stream but read on the compute stream, so whether the
-        # consumer must record_stream it before dropping it; and the bf16
-        # dtype for models whose hidden states are not bf16.
-        buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
+        # Host staging hands the pool's ping-pong slot view in as the
+        # receive buffer - still exact-size (the slot view is sliced to
+        # num_elements by the pool), and recycled by the pool as soon as
+        # the segmented D2H completes instead of by the allocator.
+        # TODO(lwd): confirm two points about the self-allocated path: it
+        # is allocated on the channel stream but read on the compute
+        # stream, so whether the consumer must record_stream it before
+        # dropping it; and the bf16 dtype for models whose hidden states
+        # are not bf16.
+        if req.recv_buffer is not None:
+            if req.recv_buffer.numel() != req.num_elements:
+                raise RuntimeError(
+                    f"recv buffer numel {req.recv_buffer.numel()} != "
+                    f"num_elements {req.num_elements} on channel "
+                    f"{self.channel_type.value} (HCCL P2P parity)"
+                )
+            buffer = req.recv_buffer
+        else:
+            buffer = torch.empty(req.num_elements, dtype=torch.bfloat16, device="npu")
         aux_buffer = None
         if self.channel_type == LwdChannelType.UP and req.aux_num_elements > 0:
             # aux frame size = num_tokens * 3 (mrope positions); the dtype is

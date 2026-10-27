@@ -39,6 +39,7 @@ class LwdTransferFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: torch.npu.Event | None = None,
     ) -> None:
         self._request = request
         self._handles = handles
@@ -46,6 +47,7 @@ class LwdTransferFuture:
         self._tensor = tensor
         self._aux_tensor = aux_tensor
         self._keepalive = keepalive
+        self._staged_event = staged_event
         self._status = LwdTransferStatus.PENDING
         self._error: BaseException | None = None
         self._lock = threading.Lock()
@@ -70,6 +72,7 @@ class LwdTransferFuture:
         tensor: torch.Tensor | None = None,
         keepalive: Any = None,
         aux_tensor: torch.Tensor | None = None,
+        staged_event: torch.npu.Event | None = None,
     ) -> None:
         with self._done_cond:
             self._handles = handles
@@ -77,6 +80,7 @@ class LwdTransferFuture:
             self._tensor = tensor
             self._aux_tensor = aux_tensor
             self._keepalive = keepalive
+            self._staged_event = staged_event
             self._done_cond.notify_all()
 
     # ------------------------------------------------------------------ #
@@ -173,6 +177,45 @@ class LwdTransferFuture:
         event = self._done_event
         if event is not None:
             torch.npu.current_stream().wait_event(event)
+
+    # ------------------------------------------------------------------ #
+    # Host staging (segmented D2H)                                       #
+    # ------------------------------------------------------------------ #
+
+    def staged_done(self) -> bool:
+        """Pure-CPU query of the segmented-D2H completion event.
+
+        ``True`` implies the pinned host copies are complete (the event is
+        recorded on the channel's copy stream behind the last segment).
+        Always ``True`` when staging was not requested, so callers can use
+        it as a plain readiness gate after ``done()``.
+        """
+        event = self._staged_event
+        if event is None:
+            return True
+        try:
+            return bool(event.query())
+        except Exception as exc:  # device error surfaces as ERROR
+            with self._lock:
+                if self._status is LwdTransferStatus.PENDING:
+                    self._status = LwdTransferStatus.ERROR
+                    self._error = exc
+                    self._done_cond.notify_all()
+            return True
+
+    def release_device_tensor(self) -> None:
+        """Drop the device-frame reference after its D2H copy completed.
+
+        With host staging the receive buffer belongs to the caller's
+        ping-pong pool and is recycled by the next receive once the pool
+        frees the slot; a completed future holding the view would only
+        keep the slot's device memory pinned. No-op when staging was not
+        requested (then the device frame IS the delivered payload and
+        ``result()`` must keep serving it)."""
+        if self._staged_event is None:
+            return
+        with self._done_cond:
+            self._tensor = None
 
     # ------------------------------------------------------------------ #
     # Lifecycle                                                           #

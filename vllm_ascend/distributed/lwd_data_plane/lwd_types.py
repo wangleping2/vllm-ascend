@@ -76,6 +76,28 @@ class LwdTransferRequest:
     # the channel structure.
     aux_dtype: Any | None = None
 
+    # ------------------------------------------------------------------ #
+    # recv-side optional landing (host staging; see                     #
+    # lwd_cloud_model.lwd_host_stage)                                    #
+    # ------------------------------------------------------------------ #
+    # recv: caller-provided main-frame receive buffer (an NPU ping-pong
+    # slot view owned by the caller's stager). When set, the channel does
+    # not allocate its own buffer - the slot is recycled as soon as the
+    # segmented D2H completes (publish). numel must equal num_elements
+    # exactly (HCCL P2P parity); the channel asserts it.
+    recv_buffer: Any | None = None
+    # recv: segmented D2H plan ``[(dst_pinned_view, src_elem_offset,
+    # numel)]``. When not None, the channel copies the received payload
+    # segment-by-segment into the per-request pinned buffers on a
+    # dedicated copy stream right after the recv completes, and records
+    # the staged event the future exposes via ``staged_done()`` - the
+    # comm thread never blocks on a copy.
+    stage_segments: Any | None = None
+    # recv: which stager device slot this recv landed in (-1 = not
+    # pooled). Diagnostics only: the pool's occupancy bookkeeping is the
+    # caller's; this rides the request so logs and leak hunts line up.
+    recv_slot: int = -1
+
 
 @dataclass
 class LwdTransferResult:
