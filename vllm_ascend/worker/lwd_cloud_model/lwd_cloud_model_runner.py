@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
     from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker import LwdCloudWorker
+    from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
 
 
 class LwdDownSelection(NamedTuple):
@@ -209,21 +211,29 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         scheduler_output: SchedulerOutput,
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None]:
-        """Embeds overwrite happens after super(); no harvest before it.
+        """Stage the step's prefill windows before super(); inject after.
 
         Arrival-driven host staging (cpu_offload design v8): the comm
         thread lands each recv's rows in the per-request pinned buffers
-        as the recvs complete - there is no harvest step, no seqno/meta
-        bookkeeping and no pre-super() recv wait here; the inject below
-        pulls each request's scheduled prefill window straight from its
-        own host buffer.
+        as the recvs complete. This step's injectable rows are staged
+        H2D into a shared window buffer on a dedicated copy stream
+        (endpoint rank only) and broadcast once across the TP group, so
+        every rank holds the same rows (W4: every rank derives an
+        identical plan from the same scheduler output and input batch).
+        ``_update_states`` runs before ``_prepare_inputs`` is entered
+        (base execute_model), so the plan already includes this step's
+        newly admitted requests.
 
-        The embeds overwrite stays after super(): the base fill loop and
-        copy_to_gpu only see zero buffers, then the staged rows are
+        The inject stays after super(): the base fill loop and
+        copy_to_gpu only see zero buffers, then the window rows are
         written straight into the inputs_embeds.gpu scheduling window
-        of the current step (last write wins) - non-blocking from pinned
-        host memory.
+        of the current step (last write wins).
         """
+        # H2D staging + TP broadcast before super(): the side-stream
+        # copies overlap with super()'s host-side work; the compute
+        # stream only waits on the ready event recorded after the last
+        # copy.
+        dev, win_idx = self._lwd_harvest_staged_window(num_scheduled_tokens)
         # Skip the base fill loop's per-row copy for LWD placeholder rows
         # (gpu_model_runner.py:952-996): it host-memcpys 84MB from the CPU
         # assembly buffer (all zeros at this point) plus an H2D into
@@ -241,7 +251,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.input_batch.req_prompt_embeds = embeds_map
         self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
         self._lwd_release_consumed_prompt_embeds()
-        self._lwd_inject_from_stager(num_scheduled_tokens)
+        self._lwd_inject_from_stager(dev, win_idx, num_scheduled_tokens)
         if self.lwd_hash_state is not None:
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
         return out
@@ -637,18 +647,169 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if stager.take_req(req_id) is not None:
                 stager.release_request(req_id)
 
-    def _lwd_inject_from_stager(self, num_scheduled_tokens: np.ndarray) -> None:
-        """Per-request inject (arrival-driven): each request fetches
-        exactly its scheduled prefill rows ``[consumed, consumed+w)`` from
-        its own host buffer and writes them into its flattened
-        ``inputs_embeds`` window - fetch-as-much-as-scheduled, coordinate
-        systems kept apart.
+    def _lwd_prefill_windows(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> list[tuple[int, str, int, int]]:
+        """This step's injectable rows: ``(input_batch index, req_id,
+        num_computed, window rows)`` per request with prefill rows left.
 
-        Prefill guard: only rows below the prompt end are staged
-        (``ncomp < nprog``); decode/draft rows ride the token-ids path
-        and never touch the stager. Without the guard, a request's first
-        decode step would read past ``recv_rows`` (the W2 invariant) and
-        crash the runner.
+        Single derivation shared by the staging and inject passes - both
+        must agree on the row set and order: that is the TP broadcast
+        layout contract (every rank computes the same plan from the same
+        scheduler output and input batch, so shapes match on all ends).
+        Only rows below the prompt end qualify (``ncomp < nprog``);
+        decode/draft rows ride the token-ids path and never touch the
+        stager - without the guard, a request's first decode step would
+        read past ``recv_rows`` (the W2 invariant) and crash.
+        """
+        num_prompt = self.input_batch.num_prompt_tokens
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        plan: list[tuple[int, str, int, int]] = []
+        for i, rid in enumerate(self.input_batch.req_ids):
+            if i >= len(num_scheduled_tokens):
+                break
+            n = int(num_scheduled_tokens[i])
+            ncomp = int(num_computed[i]) if i < len(num_computed) else 0
+            nprog = int(num_prompt[i]) if i < len(num_prompt) else 0
+            if n <= 0 or ncomp >= nprog:
+                continue
+            w = min(n, nprog - ncomp)
+            if w > 0:
+                plan.append((i, rid, ncomp, w))
+        return plan
+
+    def _lwd_h2d_stream(self) -> torch.npu.Stream:
+        """Dedicated H2D copy stream: the window copies overlap with
+        super()'s host-side work; the compute stream only waits on the
+        ready event recorded after the last copy."""
+        stream = getattr(self, "_lwd_h2d_copy_stream", None)
+        if stream is None:
+            stream = torch.npu.Stream()
+            self._lwd_h2d_copy_stream = stream
+        return stream
+
+    def _lwd_window_device(self, numel: int) -> tuple[torch.Tensor, int]:
+        """Shared device window holding one step's staged rows,
+        double-buffered (alternating steps) so the side-stream copy of
+        step N+1 can start while step N's forward still reads its buffer
+        (WAR via the used event recorded at inject time). Grows once to
+        the scheduler's token budget, then reuses."""
+        bufs = getattr(self, "_lwd_win_dev", None)
+        if bufs is None or bufs[0].numel() < numel:
+            hidden = self.model_config.get_hidden_size()
+            max_tokens = int(
+                getattr(
+                    getattr(self.vllm_config, "scheduler_config", None),
+                    "max_num_batched_tokens",
+                    0,
+                )
+                or 0
+            )
+            cap = max(numel, hidden * max_tokens)
+            bufs = [
+                torch.empty(max(cap, numel), dtype=torch.bfloat16, device=self.device)
+                for _ in range(2)
+            ]
+            self._lwd_win_dev = bufs
+            self._lwd_win_flip = 0
+            self._lwd_win_used_ev: list[torch.npu.Event | None] = [None, None]
+            lwd_logger.info(
+                "[Lwd][host-stage] win_dev allocated numel=%d x2 "
+                "(double-buffered)",
+                bufs[0].numel(),
+            )
+        win_idx = self._lwd_win_flip
+        self._lwd_win_flip = 1 - win_idx
+        return bufs[win_idx], win_idx
+
+    def _lwd_harvest_staged_window(
+        self, num_scheduled_tokens: np.ndarray
+    ) -> tuple[torch.Tensor | None, int | None]:
+        """Stage this step's prefill rows H2D and broadcast them to the TP
+        group: the endpoint copies each request's ``[consumed,
+        consumed+w)`` host rows into a shared window, every other rank
+        receives the same window (it holds no host stager - the broadcast
+        is its only source of the rows).
+
+        Returns ``(window, win_idx)``; ``(None, None)`` when this step
+        injects nothing - the empty-plan decision is derived identically
+        on every rank, so the broadcast call cannot diverge across the
+        group.
+        """
+        plan = self._lwd_prefill_windows(num_scheduled_tokens)
+        if not plan:
+            return None, None
+        worker = self.worker
+        is_endpoint = bool(worker is not None and worker._lwd_early_recv_endpoint)
+        hidden_size = self.model_config.get_hidden_size()
+        total_rows = sum(w for _i, _rid, _ncomp, w in plan)
+        embed_numel = total_rows * hidden_size
+        if is_endpoint:
+            stager = getattr(worker, "_lwd_stager", None)
+            if stager is None:
+                # The stager is built in init_device before any recv can
+                # be posted; missing here is a wiring error, and running
+                # on would broadcast zeros to every rank.
+                raise RuntimeError(
+                    "[Lwd][cloud-runner] endpoint rank without host stager "
+                    "(host staging is mandatory in this deployment)"
+                )
+            dev, win_idx = self._lwd_window_device(embed_numel)
+            stream = self._lwd_h2d_stream()
+            used_ev = self._lwd_win_used_ev[win_idx]
+            with torch.npu.stream(stream):
+                if used_ev is not None:
+                    # WAR gate: wait for the previous consumer (inject +
+                    # broadcast) of this buffer before overwriting it.
+                    stream.wait_event(used_ev)
+                offset = 0
+                for _i, rid, ncomp, w in plan:
+                    self._lwd_stage_one_request(
+                        stager, rid, ncomp, w, dev, offset
+                    )
+                    offset += w * hidden_size
+                ready_ev = torch.npu.Event()
+                ready_ev.record(stream)
+            # Order the compute stream after the copies before the
+            # broadcast reads the window (stream-order marker only - the
+            # CPU does not block here).
+            torch.npu.current_stream().wait_event(ready_ev)
+            for _i, rid, _ncomp, w in plan:
+                stager.consume(rid, w)
+            lwd_logger.info(
+                "[Lwd][cloud-runner] CONSUME rows=%d reqs=%d host_MB=%.1f",
+                total_rows,
+                len(plan),
+                stager.host_bytes / 2**20,
+            )
+        else:
+            # Receive side of the broadcast: same row total as the
+            # endpoint (W4), plain allocation - no host stager locally.
+            dev = torch.empty(embed_numel, dtype=torch.bfloat16, device=self.device)
+            win_idx = None
+        tp = get_tp_group()
+        if tp.world_size > 1:
+            # Framework TP group on the compute stream: launch + wait in
+            # the same stream context is the verified reliable shape
+            # (broadcasts launched out-of-stream were measured racing
+            # ahead of the producing copy and delivering stale rows).
+            work = dist.broadcast(
+                dev, src=tp.ranks[0], group=tp.device_group, async_op=True
+            )
+            work.wait()
+        return dev, win_idx
+
+    def _lwd_stage_one_request(
+        self,
+        stager: LwdHostStager,
+        rid: str,
+        ncomp: int,
+        w: int,
+        buf: torch.Tensor,
+        elem_offset: int,
+    ) -> None:
+        """Copy one request's ``[consumed, consumed+w)`` host rows into its
+        window slice (endpoint rank, side copy stream).
 
         Identity check: the host read pointer MUST equal the scheduler's
         computed watermark. Rows are read from ``[consumed, ...)`` and
@@ -656,49 +817,66 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         two diverge (a batch staged twice, a window start mis-derived,
         preemption without a rewind), the model gets shifted embeddings
         - silent truncation/blank output, no error, no garbage. Fail
-        loudly instead.
+        loudly instead. W2 (rows <= arrived) is enforced authoritatively
+        inside ``segment_for``'s read_range.
         """
-        stager = getattr(self.worker, "_lwd_stager", None)
-        if stager is None:
-            # Non-endpoint rank (no stager): nothing is staged locally.
-            # NOTE: this minimal port has no in-group TP broadcast; TP>1
-            # clouds require the shared-window broadcast port.
+        consumed = stager.consumed_rows(rid)
+        if consumed != ncomp:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={rid}: "
+                f"host read pointer consumed={consumed} != computed="
+                f"{ncomp} (rows={w}); the embeddings would be injected "
+                f"at a position that does not match the data read"
+            )
+        host_start, numel, _tail = stager.segment_for(rid, w)
+        buf[elem_offset : elem_offset + numel].copy_(
+            stager.take_req(rid).host[host_start : host_start + numel],
+            non_blocking=True,
+        )
+
+    def _lwd_inject_from_stager(
+        self,
+        dev: torch.Tensor | None,
+        win_idx: int | None,
+        num_scheduled_tokens: np.ndarray,
+    ) -> None:
+        """Write the staged window rows into each request's flattened
+        ``inputs_embeds`` slot (post-super(), device-side).
+
+        Layout: the window packs this step's injectable rows in
+        input_batch order (the same plan the endpoint staged); each
+        request's prefill rows are the FIRST ``w`` rows of its flattened
+        segment ``[ncomp, ncomp+n)`` - the flat offset advances by the
+        full ``n`` so the trailing decode rows keep their positions.
+        """
+        if dev is None:
             return
         hidden_size = self.model_config.get_hidden_size()
+        embeds = dev.view(-1, hidden_size)
         gpu_embeds = self.inputs_embeds.gpu
-        num_prompt = self.input_batch.num_prompt_tokens
-        num_computed = self.input_batch.num_computed_tokens_cpu
+        planned = {i: w for i, _rid, _ncomp, w in self._lwd_prefill_windows(num_scheduled_tokens)}
+        row = 0
         flat = 0
-        for i, rid in enumerate(self.input_batch.req_ids):
-            n = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
-            ncomp = int(num_computed[i]) if i < len(num_computed) else 0
-            nprog = int(num_prompt[i]) if i < len(num_prompt) else 0
-            emb = stager.take_req(rid)
-            if emb is None or n <= 0 or ncomp >= nprog:
-                # Not staged / idle row / decode phase: the token-ids
-                # path owns these rows; only the flat offset advances.
-                flat += n
-                continue
-            w = min(n, nprog - ncomp)
-            consumed = stager.consumed_rows(rid)
-            if consumed != ncomp:
-                raise RuntimeError(
-                    f"[Lwd][cloud-runner] STAGE POSITION MISMATCH req={rid}: "
-                    f"host read pointer consumed={consumed} != computed="
-                    f"{ncomp} (rows={w}); the embeddings would be injected "
-                    f"at a position that does not match the data read"
+        n_reqs = min(len(self.input_batch.req_ids), len(num_scheduled_tokens))
+        for i in range(n_reqs):
+            n = int(num_scheduled_tokens[i])
+            w = planned.get(i, 0)
+            if w > 0:
+                gpu_embeds[flat : flat + w].copy_(
+                    embeds[row : row + w], non_blocking=True
                 )
-            start, numel_seg, _tail = stager.segment_for(rid, w)
-            seg = emb.host[start : start + numel_seg].view(w, hidden_size)
-            # The request's prefill rows are the FIRST w rows of its
-            # flattened segment ([ncomp, ncomp+w)); the flat offset
-            # still advances by the full n (decode rows own the rest).
-            gpu_embeds[flat : flat + w].copy_(
-                seg.to(device=gpu_embeds.device, non_blocking=True),
-                non_blocking=True,
-            )
-            stager.consume(rid, w)
+                row += w
             flat += n
+        # Window lifecycle: the double-buffered slot's used event gates
+        # the next side-stream overwrite (WAR); the ad-hoc broadcast
+        # receive buffer only needs record_stream so the allocator
+        # cannot recycle the block while the inject copy is queued.
+        if win_idx is not None:
+            ev = torch.npu.Event()
+            ev.record()
+            self._lwd_win_used_ev[win_idx] = ev
+        else:
+            dev.record_stream(torch.npu.current_stream())
 
     # ------------------------------------------------------------------ #
     # Collect probe (measurement only; output discarded, protocol        #

@@ -44,9 +44,9 @@ two sides cannot compute it differently; aux frame numel = aux_rows*3
 (int64, [n,3], same seqno as the main frame).
 
 Non-endpoint ranks (the cloud's remaining TP ranks) hold no cross-node
-channel: this minimal port stages on the endpoint only (no in-group TP
-broadcast yet) — they post no recv and report nothing; this module's
-hint/report line runs on the endpoint rank only.
+channel and no host stager: they post no recv and report nothing; the
+runner's shared-window TP broadcast is their only source of the staged
+rows. This module's hint/report line runs on the endpoint rank only.
 """
 
 from __future__ import annotations
