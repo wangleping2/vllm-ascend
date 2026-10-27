@@ -118,10 +118,10 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         seqno: int,
         batch_meta: LwdEmbedBatch,
         scheduler_output: "SchedulerOutput",
-    ) -> None:
+    ) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.token_ids:
-            return
+            return self._lwd_up_send_result()
 
         # Register newly arrived requests' mm features (the first chunk
         # carries data with scheduled_new_reqs; later chunks hit the
@@ -184,7 +184,14 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             tensor=payload,
             seqno=seqno,
         )
-        self.worker.comm_service.submit_send(request)
+        fut = self.worker.comm_service.submit_send(request)
+        # UP send completion tracking (FIFO prefix watermark, drained on
+        # every result this runner returns): the release semantics of
+        # the edge pending gate.
+        sent = getattr(self, "_lwd_up_send_futures", None)
+        if sent is None:
+            sent = self._lwd_up_send_futures = []
+        sent.append((seqno, fut))
         # [Lwd][perf] TTFT probes: forward = the embed forward;
         # submit_send = snapshot clone + broadcast submit (including the
         # bridge's handle.wait) — if the UP world broadcast is waiting on
@@ -198,6 +205,40 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             (time.monotonic() - _t0) * 1000,
             len(flat_token_ids),
         )
+        return self._lwd_up_send_result()
+
+    def _lwd_up_send_done_watermark(self) -> int:
+        """Highest UP send seqno whose HCCL isend completed (the channel
+        is FIFO, so the completed set is a prefix and one watermark is
+        exact).
+
+        Semantics = the cloud has RECEIVED those rows (isend completion
+        means the data landed in the peer's posted recv buffer),
+        independent of the cloud computing them - the edge lead gate
+        releases on receipt, decoupled from cloud compute completion.
+        Completed entries are also dropped here so the snapshot
+        keepalive returns to the allocator.
+        """
+        sent = getattr(self, "_lwd_up_send_futures", None)
+        if not sent:
+            return -1
+        hi = -1
+        while sent and sent[0][1].done():
+            hi = sent.pop(0)[0]
+        return hi
+
+    def _lwd_up_send_result(self) -> ModelRunnerOutput:
+        """Empty output carrying the UP send completion watermark.
+
+        The embed batch itself produces no tokens; the watermark rides
+        this result to the edge scheduler, whose pending gate releases
+        on send completion (not on first token)."""
+        return ModelRunnerOutput(
+            req_ids=[],
+            req_id_to_index={},
+            sampled_token_ids=[],
+            lwd_up_send_watermark=self._lwd_up_send_done_watermark(),
+        )
 
     @torch.inference_mode()
     def execute_lwd_unembed(
@@ -205,7 +246,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
     ) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.req_ids:
-            return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
+            return self._lwd_up_send_result()
 
         _t0 = time.monotonic()
         recv_future = self.worker.comm_service.submit_recv(
@@ -282,4 +323,8 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             req_ids=batch_meta.req_ids,
             req_id_to_index=req_id_to_index,
             sampled_token_ids=sampled_token_ids,
+            # The unembed step is the denser watermark carrier (decode
+            # embed traffic is sparse): it closes the "final embed send
+            # completed but nobody reported it" tail leak.
+            lwd_up_send_watermark=self._lwd_up_send_done_watermark(),
         )
