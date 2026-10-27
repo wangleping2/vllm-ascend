@@ -44,10 +44,9 @@ two sides cannot compute it differently; aux frame numel = aux_rows*3
 (int64, [n,3], same seqno as the main frame).
 
 Non-endpoint ranks (the cloud's remaining TP ranks) hold no cross-node
-channel: their data arrives via the in-group TP broadcast at inject time
-(see ``lwd_cloud_model_runner._lwd_inject_remote_embeds``) — they post no
-recv and report nothing; this module's hint/report line runs on the
-endpoint rank only.
+channel: this minimal port stages on the endpoint only (no in-group TP
+broadcast yet) — they post no recv and report nothing; this module's
+hint/report line runs on the endpoint rank only.
 """
 
 from __future__ import annotations
@@ -70,6 +69,13 @@ if TYPE_CHECKING:
 #: ``init_device`` — both sides honor this single constant name.
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
+#: Per-request row table carried by a recv hint (see ``hint_row_table``):
+#: (req_ids, chunk rows, prompt_offsets, prompt_lens). Chunk rows are
+#: batch-layout coordinates; prompt offsets are prompt coordinates - the
+#: two must never be merged (a request can arrive across several chunks).
+LwdRecvRowTable = tuple[list[str], list[int], list[int], list[int]]
+
+
 # Bypass MQ spec: 1KB per slot, 64 slots. One hint/report per batch; the
 # edge pending gate (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS = 3``)
 # keeps unconsumed chunks in the single digits, and hints are a
@@ -87,26 +93,39 @@ def make_recv_hint(
     seqno: int,
     num_tokens: int,
     aux_rows: int = 0,
-    req_rows: list | None = None,
+    req_ids: list | None = None,
+    rows: list | None = None,
+    prompt_offsets: list | None = None,
     prompt_lens: list | None = None,
 ) -> dict:
-    """Build one UP early-recv hint.
+    """Build one UP early-recv hint carrying the host-staging row table.
 
     * ``num_tokens``: the batch's flat token count (the main-frame size
       is derived worker-side from the hash payload formula)
     * ``aux_rows``: the batch's mrope-carrying token rows (0 = text-only
       batch, zero aux traffic)
+    * ``req_ids``/``rows``: per-request ids and THIS CHUNK's row counts
+      (same order as the notify items; the batch-internal payload layout
+      derives from the rows by accumulation)
+    * ``prompt_offsets``: each chunk's start within its OWN prompt (the
+      stager's row_base)
+    * ``prompt_lens``: per-request full prompt rows (host buffer sizing
+      authority, one-shot allocation at first chunk)
+
+    The two coordinate systems (chunk rows vs prompt offsets) must both
+    ride the hint and must never be merged: a request can be delivered
+    across several chunks, and where the second segment lands in the
+    request's buffer (prompt coordinate) is independent of where it sits
+    in this batch's payload (chunk-accumulated coordinate). Merging them
+    writes the second chunk over the first one's rows - silently.
     """
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
-        # Absolute per-request arrival rows in PROMPT coordinates
-        # (offset + rows of the range item): the worker piggybacks them on
-        # the done report, the engine's hold ledger releases on them.
-        "req_rows": [(str(r), int(n)) for r, n in (req_rows or [])],
-        # Per-request prompt total length (stager pool sizing authority;
-        # the comm-thread D2H uses it to size host buffers at full length).
-        "prompt_lens": [int(n) for n in (prompt_lens or [])],
+        "req_ids": [str(r) for r in (req_ids or ())],
+        "rows": [int(r) for r in (rows or ())],
+        "prompt_offsets": [int(o) for o in (prompt_offsets or ())],
+        "prompt_lens": [int(n) for n in (prompt_lens or ())],
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),
     }
@@ -123,6 +142,41 @@ def hint_fields(hint: dict) -> tuple[int, int, int] | None:
     if seqno < 0 or num_tokens <= 0 or aux_rows < 0 or aux_rows > num_tokens:
         return None
     return seqno, num_tokens, aux_rows
+
+
+def hint_row_table(hint: dict) -> LwdRecvRowTable | None:
+    """Row-table self-check: ``(req_ids, rows, prompt_offsets,
+    prompt_lens)``; None when the table is absent or inconsistent.
+
+    A mismatched table (lengths disagree with the request count, rows
+    not summing to the flat token count, non-positive lengths) would
+    make the stager slice windows by wrong rows and write embeddings
+    into another request's position - silent corruption - so a bad table
+    dies at the entrance and the hint is dropped by the caller.
+    """
+    try:
+        req_ids = [str(r) for r in hint["req_ids"]]
+        rows = [int(r) for r in hint["rows"]]
+        prompt_offsets = [int(o) for o in hint["prompt_offsets"]]
+        prompt_lens = [int(n) for n in hint["prompt_lens"]]
+        num_tokens = int(hint["num_tokens"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not req_ids:
+        return None
+    if (
+        len(rows) != len(req_ids)
+        or len(prompt_offsets) != len(req_ids)
+        or len(prompt_lens) != len(req_ids)
+    ):
+        return None
+    if any(r <= 0 for r in rows) or sum(rows) != num_tokens:
+        return None
+    if any(o < 0 for o in prompt_offsets):
+        return None
+    if any(n <= 0 for n in prompt_lens):
+        return None
+    return req_ids, rows, prompt_offsets, prompt_lens
 
 
 # ---------------------------------------------------------------------- #

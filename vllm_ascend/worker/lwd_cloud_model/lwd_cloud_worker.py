@@ -33,6 +33,12 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
 )
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
+from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
+from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+    LwdRecvRowTable,
+    hint_fields,
+    hint_row_table,
+)
 
 if TYPE_CHECKING:
     from typing import Any
@@ -40,7 +46,6 @@ if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle
     from vllm.v1.core.sched.output import (
         GrammarOutput,
-        LwdEmbedBatch,
         SchedulerOutput,
     )
 
@@ -62,8 +67,6 @@ class LwdCloudWorker(LwdWorkerBase):
         super().init_device()
         # channel-global DOWN seqno counter (worker layer, send-time alloc)
         self._lwd_down_next_seqno = 0
-        # req_id -> posted UP recv futures (consumed by the runner's device-side inject)
-        self._lwd_up_recv_futures: dict[int, tuple[LwdTransferFuture | None, LwdEmbedBatch]] = {}
         # [Lwd][pre-recv] Early receive: only the endpoint rank (= the only
         # cloud rank holding a cross-node P2P channel, same convention as
         # the data-plane channels) pre-posts the real irecv and reports completion
@@ -103,8 +106,54 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_up_hidden_size,
         )
         if self._lwd_early_recv_endpoint:
+            # Host stager BEFORE any recv can be posted (the comm thread
+            # starts right after): the arrival-ledger driver requires it.
+            self._lwd_init_host_stager(self._lwd_up_hidden_size)
             self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
+
+    def _lwd_init_host_stager(self, hidden_size: int) -> None:
+        """Build the host staging pool (endpoint rank only).
+
+        Arrival-driven scheduling DEPENDS on the per-request arrival rows
+        this pool publishes: without the stager the ledger stays at 0,
+        the visible-set predicate rejects every prefill request and the
+        whole system deadlocks silently - scheduling and reporting are
+        two halves of the same feature and must both be present.
+
+        Slot sizing uses the hash payload formula (embeds + optional
+        expert-ID tail): the UP recv numel is hash_payload_numel
+        (_lwd_build_up_recv_request); sizing by hidden alone makes the
+        allocate geometry check reject every DSV4 batch.
+        """
+
+        def _pinned(n: int) -> torch.Tensor:
+            return torch.empty(n, dtype=torch.bfloat16, device="cpu").pin_memory()
+
+        _cfg = self.model_config.hf_config
+        _max_tok = (
+            getattr(self.vllm_config.scheduler_config, "max_num_batched_tokens", 0) or 0
+        )
+        _max_numel = hash_payload_numel(
+            _max_tok,
+            hidden_size,
+            hash_layer_count(_cfg),
+            int(getattr(_cfg, "num_experts_per_tok", 0) or 0),
+        )
+        self._lwd_stager = LwdHostStager(
+            device="cpu",
+            slots=self._early_recv_max_inflight,
+            empty_factory=_pinned,
+            max_numel=_max_numel or None,
+        )
+        lwd_logger.info(
+            "[Lwd][host-stage] stager ready slots=%d max_numel=%d "
+            "(max_tokens=%d hidden=%d, no host cap)",
+            self._early_recv_max_inflight,
+            _max_numel,
+            _max_tok,
+            hidden_size,
+        )
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last
@@ -151,9 +200,10 @@ class LwdCloudWorker(LwdWorkerBase):
             self.rank,
             time.monotonic(),
         )
-        # cloud: post the exact-size UP irecv for every incoming
-        # LWD_EMBED batch (control info rides scheduler_output.lwd_batch).
-        self._lwd_up_post_recvs(scheduler_output)
+        # No SO-driven UP recv posting under host staging: the comm thread
+        # pre-posts every recv from the engine's hints, and the runner
+        # harvests by input_batch (arrival-driven, no SO consumption
+        # point).
 
         # cloud: finished requests trigger local cleanup (collector
         # bookkeeping + UP chunk table); finished_req_ids is the
@@ -173,119 +223,6 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         return output
 
-    def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
-        """Bind the UP recv for an incoming LWD_EMBED batch.
-
-        The UP two-phase communication splits into two instants per the
-        demo_br pattern:
-          * post time (this function): only the endpoint rank posts the
-            channel P2P recv; non-endpoints just register the meta;
-          * consume time (the runner's inject side): every rank launches
-            the in-group TP broadcast *on its own compute stream* followed
-            immediately by work.wait() — under torch_npu, cross-stream
-            ordering between two HCCL ops cannot be trusted (broadcasts
-            launched at post time were measured racing ahead of the irecv
-            and delivering truncated data); a launch+wait pair in the same
-            stream context is the demo-verified reliable shape.
-
-        Early recv: the endpoint's irecv has already been pre-posted by the
-        comm thread on the engine's hint (posted as soon as the RangeNotify
-        arrives, not waiting for this SO); this function only takes that
-        future. The gate (``_lwd_pre_recv_ready``) guarantees it is posted
-        before release. Should a hint never arrive, the same information
-        re-posts it here (see ``get_or_post_early_recv``) — no missed recv.
-
-        All control info rides the SchedulerOutput (edge -> cloud
-        control plane fills it in): batch.seqno is the edge-side dispatch
-        number (the cross-node pairing key); the recv size covers the
-        embeddings plus optional Hash expert IDs."""
-        from vllm.v1.core.sched.output import LwdBatchType
-
-        batch = getattr(scheduler_output, "lwd_batch", None)
-        if batch is None or batch.batch_type is not LwdBatchType.LWD_EMBED:
-            return
-        meta = batch.batch_meta
-        if meta is None or not meta.req_ids:
-            return
-        num_tokens = sum(len(t) for t in meta.token_ids)
-        if num_tokens <= 0:
-            return
-        # mrope positions moved to the control plane
-        # (LwdRangeItem.mrope_positions arrives with the meta,
-        # wire_version>=2); the UP recv posts only the main embeds frame
-        # and aux_rows is always 0 — a stale nonzero would leave the
-        # pre-posted aux irecv forever unmatched and stall the watermark.
-        # The aux frame mechanism stays in the channel layer for deepstack
-        # and other future payloads.
-        if self._lwd_early_recv_endpoint:
-            future = self.get_or_post_early_recv(batch.seqno, num_tokens, 0)
-        else:
-            # Non-endpoint: never touches the cross-node channel; the
-            # broadcast receive is deferred to inject time. None marks
-            # "broadcast on consumption".
-            future = None
-        self._lwd_up_recv_futures[batch.seqno] = (future, meta)
-        # A3: host stager owns per-request CPU copies; its publish_received
-        # rows are the authoritative arrival signal (the runner bridge feeds
-        # them onto the done MQ after the D2H lands).
-        if getattr(self, "_lwd_stager", None) is None:
-            import torch
-            from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
-                LwdHostStager,
-            )
-
-            def _pinned(n: int):
-                return torch.empty(n, dtype=torch.bfloat16, device="cpu").pin_memory()
-
-            # Slot sizing must use the hash payload formula (embeds +
-            # optional expert-ID tail): DSV4 recv numel is hash_payload_numel
-            # (_lwd_build_up_recv_request); sizing by hidden alone makes the
-            # allocate geometry check reject every DSV4 batch (b4192e749).
-            from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
-                hash_layer_count,
-            )
-            _cfg = self.model_config.hf_config
-            _max_tok = (
-                getattr(self.vllm_config.scheduler_config, "max_num_batched_tokens", 0) or 0
-            )
-            _max_numel = hash_payload_numel(
-                _max_tok,
-                self.model_config.get_hidden_size(),
-                hash_layer_count(_cfg),
-                int(getattr(_cfg, "num_experts_per_tok", 0) or 0),
-            )
-            self._lwd_stager = LwdHostStager(
-                device="cpu", slots=4, empty_factory=_pinned, max_numel=_max_numel or None
-            )
-        if future is None:
-            # Seven INFO lines per batch is pure noise; demoted to DEBUG
-            # (with VLLM_LOGGING_LEVEL=DEBUG the per-rank forward entry
-            # times/spread are still visible)
-            lwd_logger.debug(
-                "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d endpoint=False ts=%.3f",
-                batch.seqno,
-                len(meta.req_ids),
-                num_tokens,
-                time.monotonic(),
-            )
-            return
-        # One memory reading per batch (only the endpoint rank holds recv
-        # buffers): a climbing peak = something is leaking; mem_free
-        # approaching 0 = OOM precursor.
-        free_bytes, _total = torch.npu.mem_get_info()
-        lwd_logger.info(
-            "[Lwd][pre-recv] POST seqno=%d reqs=%d tokens=%d "
-            "endpoint=True ts=%.3f mem_alloc=%.2fGiB mem_peak=%.2fGiB "
-            "mem_free=%.2fGiB",
-            batch.seqno,
-            len(meta.req_ids),
-            num_tokens,
-            time.monotonic(),
-            torch.npu.memory_allocated() / 2**30,
-            torch.npu.max_memory_allocated() / 2**30,
-            free_bytes / 2**30,
-        )
-
     # ------------------------------------------------------------------ #
     # Early receive: comm thread (hint -> post recv -> report watermark) #
     # ------------------------------------------------------------------ #
@@ -294,34 +231,39 @@ class LwdCloudWorker(LwdWorkerBase):
         """The early-recv ledger (same keys as the engine-issued hints and
         the reported watermarks).
 
-        Key = (channel, seqno). Entry lifecycle: a hint submits the recv
-        and registers the entry; the consume point
-        ``get_or_post_early_recv`` only *takes and marks consumed* (no
-        pop: the reporter thread keeps polling it to advance the
-        watermark); removal happens only once both reported and consumed.
+        Key = (channel, seqno). Entry lifecycle under host staging:
+        a hint submits the recv and registers the entry; once the recv
+        completes AND the segmented D2H lands in the per-request pinned
+        buffers (``publish_received``), the entry is popped
+        (**publish-then-pop**: after the publish the future bookkeeping
+        has no readers - the runner harvests by input_batch, there is no
+        SO consumption point) and the next queued hint is posted.
+
+        ``_early_recv_last_delivered`` is the highest seqno already
+        delivered (received + staged + reported). Channel completion
+        order = seqno order, so the delivered set is always a prefix and
+        one watermark represents it exactly. ``start_early_irecv``
+        rejects any hint at or below it: the edge sends one frame per
+        seqno, and posting a second recv for an already-delivered seqno
+        misaligns the whole channel by one frame WITHOUT any error.
 
         **In-flight cap = 3**: each posted recv holds a whole-batch-sized
-        receive buffer (aux frames included), and this 3 shares its source
-        with the edge-side pending gate — ``LwdEdgeScheduler`` caps edge
-        lead by unconsumed chunks at ``_LWD_MAX_PENDING_CHUNKS = 3``, so
-        the cloud never needs more than those 3. Hints beyond the cap
-        queue first (``_early_recv_pending``, arrival-ordered, fields only
-        — no device memory) and post as soon as a slot frees when an
-        earlier batch is consumed with its SO. The slot must be returned
-        on "consumed with the SO" (= dispatched), NOT on "received":
-        the gate releases batch N once the watermark >= N, and
-        execute_model immediately takes that future; if slots were
-        returned only on completion, batch N+1's recv might not be posted
-        yet and the gate would run ahead of the recv.
+        channel receive buffer until its D2H lands, and this 3 shares its
+        source with the edge-side pending gate
+        (``LwdEdgeScheduler._LWD_MAX_PENDING_CHUNKS``). Hints beyond the
+        cap queue first (``_early_recv_pending``, arrival-ordered,
+        fields only — no device memory) and post as soon as an earlier
+        batch publishes.
         """
         self._early_recv_max_inflight = 3
         self._early_recv_futures: dict[tuple[LwdChannelType, int], LwdTransferFuture] = {}
-        self._early_recv_req_rows: dict[tuple, list] = {}
+        # key -> per-request row table from the hint; consumed at D2H
+        # commit time
+        self._early_recv_row_tables: dict[tuple[LwdChannelType, int], LwdRecvRowTable] = {}
         self._early_recv_lock = threading.Lock()
-        # Keys already taken by the consume point: prevents the comm thread from posting a duplicate recv on a late hint
-        self._early_recv_consumed: set[tuple[LwdChannelType, int]] = set()
-        # Keys whose completion has been reported
-        self._early_recv_reported: set[tuple[LwdChannelType, int]] = set()
+        # Highest seqno already delivered (published + reported); the
+        # prefix-watermark guard against duplicate/late hints
+        self._early_recv_last_delivered: int = -1
         # Hints queued while the in-flight cap is full (key -> hint, insertion order = arrival order)
         self._early_recv_pending: dict[tuple[LwdChannelType, int], dict[str, Any]] = {}
         # Rate-limit timestamp for the stuck-queue diagnostic
@@ -477,32 +419,43 @@ class LwdCloudWorker(LwdWorkerBase):
         """Take one engine hint; post the recv immediately while slots
         remain, otherwise queue it.
 
-        Idempotent: duplicate hints for the same (channel, seqno), or ones
-        the consume point already handled, are ignored — two irecvs on one
-        channel would race the sender's single isend.
+        Idempotent: duplicate hints for the same (channel, seqno), or
+        hints for an already-delivered seqno (the
+        ``_early_recv_last_delivered`` prefix watermark), are ignored —
+        the edge sends one frame per seqno, and a second irecv for a
+        delivered seqno would misalign the whole channel by one frame
+        without any error anywhere.
         """
-        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
-
         fields = hint_fields(hint)
         if fields is None:
             lwd_logger.warning("[Lwd][pre-recv] malformed hint %s, skipped", hint)
             return
-        seqno, _num_tokens, _aux_rows = fields
+        table = hint_row_table(hint)
+        if table is None:
+            # Without a consistent row table the stager cannot split the
+            # payload per request; a wrong table writes embeddings into
+            # another request's buffer (silent corruption). Dropping the
+            # hint leaves that batch's requests unscheduled - loud enough
+            # to debug, unlike a mis-staged batch.
+            lwd_logger.warning(
+                "[Lwd][pre-recv] hint seqno=%d carries no consistent row "
+                "table, dropped (both sides must deploy the row-table "
+                "hint protocol)",
+                fields[0],
+            )
+            return
+        seqno = fields[0]
         key = (hint["channel"], seqno)
-        # A2: absolute per-request arrival rows ride the hint; remembered per
-        # key so the done report can piggyback them (engine hold release).
-        self._early_recv_req_rows[key] = list(hint.get("req_rows") or ())
-        # D2H needs per-request prompt total length (stager pool sizing)
-        if not hasattr(self, "_lwd_prompt_lens"):
-            self._lwd_prompt_lens: dict[str, int] = {}
-        for rid, _rows in (hint.get("req_rows") or ()):
-            self._lwd_prompt_lens.setdefault(rid, 0)
-        pl = hint.get("prompt_lens") or []
-        for (rid, _r), p_len in zip(hint.get("req_rows") or (), pl):
-            self._lwd_prompt_lens[rid] = p_len
         with self._early_recv_lock:
-            if key in self._early_recv_futures or key in self._early_recv_consumed or key in self._early_recv_pending:
+            if (
+                seqno <= self._early_recv_last_delivered
+                or key in self._early_recv_futures
+                or key in self._early_recv_pending
+            ):
                 return
+            # Row table for the completion-time D2H (req_ids, rows,
+            # prompt_offsets, prompt_lens); popped at publish.
+            self._early_recv_row_tables[key] = table
             self._early_recv_pending[key] = hint
         self._early_recv_pump()
 
@@ -510,20 +463,25 @@ class LwdCloudWorker(LwdWorkerBase):
         """Post queued hints as recvs in arrival order until the in-flight
         cap is full.
 
-        Slots = entries whose recv is posted but not yet consumed by an SO
-        (each holds a whole-batch receive buffer), so this cap is a memory
-        cap; ``get_or_post_early_recv`` calls this after consuming one to
-        post the next, so the hint queue never drops anything.
+        In-flight = posted but not yet published (each entry holds a
+        whole-batch channel receive buffer until its D2H lands), so this
+        cap is a memory cap; ``_report_irecv_completions`` calls this
+        after each publish, so the hint queue never drops anything.
         """
-        from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
-
         while True:
             with self._early_recv_lock:
                 if not self._early_recv_pending or len(self._early_recv_futures) >= self._early_recv_max_inflight:
                     return
                 key, hint = next(iter(self._early_recv_pending.items()))
+                fields = hint_fields(hint)
+                if fields is None:
+                    # Belt-and-braces: malformed hints were rejected at
+                    # start_early_irecv; never let one wedge the queue.
+                    del self._early_recv_pending[key]
+                    self._early_recv_row_tables.pop(key, None)
+                    continue
                 del self._early_recv_pending[key]
-                seqno, num_tokens, aux_rows = hint_fields(hint)
+                seqno, num_tokens, aux_rows = fields
                 future = lwd_get_data_plane().submit_recv(self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows))
                 self._early_recv_futures[key] = future
                 inflight = len(self._early_recv_futures)
@@ -539,208 +497,134 @@ class LwdCloudWorker(LwdWorkerBase):
                 time.monotonic(),
             )
 
-    def lwd_harvest_pending(self) -> int:
-        """RPC delegate: drive the runner's harvest for held requests.
+    def _lwd_commit_received(
+        self, key: tuple[LwdChannelType, int], future: LwdTransferFuture
+    ) -> list[tuple[str, int]]:
+        """Completion-time segmented D2H + arrival publish (endpoint comm
+        thread): land this recv's NPU payload into the per-request pinned
+        buffers, then publish the arrival high-water marks.
 
-        The engine calls this via collective_rpc when the hold gate has
-        entries but the native scheduler produced nothing (step()
-        early-return) - the runner's _prepare_inputs path never runs, so
-        the D2H + arrival publish would deadlock without this.
+        Minimal form (cpu_offload intermediate state): the row table is
+        planned and copied synchronously HERE, not at submit time on the
+        channel layer. Accepted costs for bring-up: the comm thread
+        blocks for the D2H duration (~5-16ms per full batch) and the
+        pinned allocation runs under the stager lock (long-prompt TTFT
+        suspect); the three-phase channel-layer port (submit-time plan +
+        async segmented D2H + staged_done polling) replaces this later.
+
+        Returns the per-request CUMULATIVE arrived rows ``[(req_id,
+        rows), ...]`` for the done-MQ piggyback. Cumulative, never a
+        per-chunk delta: the engine merges with max(), the merge
+        designed for cumulative counts — a delta report once left the
+        ledger stuck at the last chunk's rows (1168+2342 delivered, the
+        ledger said 2342) and the W2 bound then rejected legitimate
+        windows.
         """
-        return self.model_runner.lwd_harvest_pending()
-
-    # TODO(lwd): replace this synchronous D2H with the cpu_offload
-    # three-phase model (perf batch 2, ~140 lines across 4 files):
-    #   1. types.py: add stage_segments to LwdTransferRequest
-    #   2. start_early_irecv: plan_recv_segments at SUBMIT time, pass
-    #      segment views to the channel via req.stage_segments
-    #   3. channel layer: async segmented D2H on a dedicated copy stream
-    #      after the recv completes (channel.py +58 lines)
-    #   4. future: add staged_done() (pure CPU event.query()); this
-    #      method then just polls staged_done + publish_received, the
-    #      synchronous .cpu() goes away entirely
-    # Net effect: the comm thread never blocks on D2H (~5-16ms per full
-    # batch currently), segments overlap with the next recv.
-    def _lwd_d2h_and_publish(self, key, future) -> None:
-        """Endpoint-rank comm-thread D2H: land the NPU payload into the
-        per-request host stager and publish arrival rows to the done MQ.
-
-        This is the arrival-ledger driver (cpu_offload design v7 §5.2):
-        independent of the engine step / scheduler output. The runner's
-        _prepare_inputs still handles TP broadcast for non-endpoint ranks
-        and the per-request injection; it no longer gates the publish.
-        """
-        stager = getattr(self, "_lwd_stager", None)
-        done_mq = self._irecv_done_mq
-        if stager is None or done_mq is None:
-            return
-        try:
-            seqno = key[1]
-            res = future.result()
-            up_flat = res.tensor
-            if up_flat is None:
-                return
-            # Plan per-request segments from the hint's geometry
-            hint = self._early_recv_req_rows.get(key) or []
-            if not hint:
-                return
-            hidden = self._lwd_up_hidden_size
-            from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
-                hash_layer_count,
-            )
-            cfg = self.model_config.hf_config
-            nl = hash_layer_count(cfg)
-            tk = int(getattr(cfg, "num_experts_per_tok", 0) or 0)
-            req_rows = [(rid, rows) for rid, rows in hint]
-            # num_tokens_per_req from the hint rows
-            num_tokens_per_req = [rows for _rid, rows in req_rows]
-            prompt_lens = []
-            for rid, _rows in req_rows:
-                prompt_lens.append(
-                    getattr(self, "_lwd_prompt_lens", {}).get(rid, 0) or rows)
-            segments = stager.plan_recv_segments(
-                seqno=seqno,
-                numel=up_flat.numel(),
-                hidden_size=hidden,
-                req_ids=[rid for rid, _r in req_rows],
-                num_tokens_per_req=num_tokens_per_req,
-                prompt_lens=prompt_lens,
-                num_hash_layers=nl,
-                num_experts_per_tok=tk,
-            )
-            for dst_view, src_off, n in segments:
-                dst_view.copy_(up_flat[src_off:src_off + n].cpu(),
-                               non_blocking=False)
-            arrivals = stager.publish_received(seqno)
-            rows = [(rid, base + n) for rid, n, base in arrivals]
-            done_mq.enqueue((key[0], seqno, rows))
-            lwd_logger.info(
-                "[LWD] staged to host seqno=%d reqs=%d rows=%s (comm thread)",
-                seqno, len(req_rows), rows)
-        except Exception:
-            lwd_logger.exception(
-                "[LWD] comm-thread D2H failed key=%s (arrival stalls)", key)
+        stager = self._lwd_stager
+        if stager is None:
+            return []
+        table = self._early_recv_row_tables.get(key)
+        if table is None:
+            return []
+        req_ids, rows, prompt_offsets, prompt_lens = table
+        seqno = key[1]
+        res = future.result()
+        up_flat = res.tensor
+        if up_flat is None:
+            return []
+        cfg = self.model_config.hf_config
+        segments = stager.plan_recv_segments(
+            seqno=seqno,
+            numel=up_flat.numel(),
+            hidden_size=self._lwd_up_hidden_size,
+            req_ids=req_ids,
+            num_tokens_per_req=rows,
+            prompt_lens=prompt_lens,
+            row_base=list(prompt_offsets) if prompt_offsets else None,
+            num_hash_layers=hash_layer_count(cfg),
+            num_experts_per_tok=int(getattr(cfg, "num_experts_per_tok", 0) or 0),
+        )
+        for dst_view, src_off, n in segments:
+            dst_view.copy_(up_flat[src_off:src_off + n].cpu(),
+                           non_blocking=False)
+        stager.publish_received(seqno)
+        arrived = [(rid, stager.recv_rows(rid)) for rid in req_ids]
+        lwd_logger.info(
+            "[Lwd][host-stage] ARRIVED seqno=%d cumulative=%s host_MB=%.1f",
+            seqno,
+            arrived,
+            stager.host_bytes / 2**20,
+        )
+        return arrived
 
     def _report_irecv_completions(self) -> None:
-        """Report completed recvs as (channel, seqno) tuples to the done MQ.
+        """Report completed recvs to the done MQ (comm thread).
 
-        Per-channel completion order = seqno order, so one max watermark
-        per channel decides readiness exactly. Entries already taken by
-        the consume point keep being polled: consumption means the forward
-        is using the data, so ``done()`` flips soon and the watermark
-        still advances; removal only once both reported and consumed.
+        Host staging (endpoint): for each future whose recv completed, run
+        the segmented D2H + publish (``_lwd_commit_received``), then send
+        ONE message carrying both the watermark key and the per-request
+        cumulative rows: ``((channel, seqno), [(req_id, rows), ...])``.
+        The engine's drain advances the watermark AND the arrival ledger
+        from the same message — the arrival rows are what the visible-set
+        scheduler reads to size each request's next window.
+
+        Publish-then-pop: once the rows are in the per-request pinned
+        buffers, the future (and its channel receive buffer) has no more
+        readers — the runner harvests by input_batch, there is no SO
+        consumption point — so the entry is popped, the delivered
+        watermark advances (blocking late/duplicate hints from re-posting
+        a delivered seqno), and the next queued hint posts immediately.
+
+        This step only queries ``future.done()``; the D2H itself is
+        synchronous here (the known minimal-version cost).
         """
         done_mq = self._irecv_done_mq
         if done_mq is None:
             return
         with self._early_recv_lock:
-            pending = [
-                (key, future)
-                for key, future in self._early_recv_futures.items()
-                if key not in self._early_recv_reported
-            ]
+            pending = list(self._early_recv_futures.items())
         for key, future in pending:
             if not future.done():
                 continue
-            # ① Completed: this recv's data (main frame + aux frame) has fully landed
+            # ① Received: this recv's data (main frame + aux frame) has
+            # fully landed in the channel receive buffer
             lwd_logger.info(
-                "[Lwd][pre-recv] DONE channel=%s seqno=%d ts=%.3f",
+                "[Lwd][pre-recv] DONE-RECV channel=%s seqno=%d ts=%.3f",
                 key[0].value,
                 key[1],
                 time.monotonic(),
             )
-            # ② Endpoint only: D2H + publish arrival rows (cpu_offload v7
-            # architecture - the comm thread drives the staged copy, NOT the
-            # runner's _prepare_inputs; this breaks the circular dependency
-            # where window_cap waits for arrival which waits for harvest
-            # which waits for scheduling which waits for window_cap).
-            if getattr(self, "_lwd_early_recv_endpoint", False):
-                self._lwd_d2h_and_publish(key, future)
-            # ② Report: write (channel, seqno) into the done MQ; the engine drains it each step to advance the watermark
-            # Watermark only (2-tuple): per-request arrival rows are
-            # reported by the runner bridge after the staged D2H lands -
-            # planned rows at NPU-arrival time would release the hold gate
-            # before the host copy exists (read-before-stage race).
-            done_mq.enqueue(key)
+            # ② Endpoint: segmented D2H + arrival publish
+            arrived: list[tuple[str, int]] = []
+            try:
+                arrived = self._lwd_commit_received(key, future)
+            except Exception:
+                # Planning/copy failure = this batch's rows never publish;
+                # its requests stall loudly (the ledger stays behind).
+                # Still pop the entry below: a held in-flight slot would
+                # wedge every later batch behind it instead.
+                lwd_logger.exception(
+                    "[Lwd] comm-thread D2H failed key=%s "
+                    "(arrival stalls for its requests)",
+                    key,
+                )
+            # ③ Report: watermark key + per-request cumulative rows
+            done_mq.enqueue((key, arrived) if arrived else key)
             lwd_logger.info(
-                "[Lwd][pre-recv] REPORT channel=%s seqno=%d ts=%.3f",
+                "[Lwd][pre-recv] REPORT channel=%s seqno=%d arrived=%s ts=%.3f",
                 key[0].value,
                 key[1],
+                arrived or "-",
                 time.monotonic(),
             )
             with self._early_recv_lock:
-                self._early_recv_reported.add(key)
-                if key in self._early_recv_consumed:
-                    self._early_recv_futures.pop(key, None)
-                    self._early_recv_reported.discard(key)
-                    self._early_recv_consumed.discard(key)
-                    released = True
-                else:
-                    released = False
-            if released:
-                self._early_recv_pump()
-
-    def get_or_post_early_recv(self, seqno: int, num_tokens: int, aux_rows: int) -> LwdTransferFuture | None:
-        """Take the comm thread's pre-posted UP recv future; if absent,
-        post one on the spot and register it.
-
-        Non-endpoint ranks hold no cross-node channel (their data arrives
-        via the TP broadcast at inject time) and get None. Entries are not
-        removed here: the reporter thread keeps polling them to advance
-        the watermark; removal only once both reported and consumed, so
-        the watermark never gaps on consumption.
-
-        This is the **slot-return point** (same role as the old
-        `note_scheduled`): once the SO arrives, this entry's buffer goes
-        straight to the forward, and the slot passes to a queued hint
-        immediately (a still-queued hint is posted in place here — the
-        gate/forward can never overtake the recv).
-        """
-        if not self._lwd_early_recv_endpoint:
-            return None
-
-        key = (LwdChannelType.UP, seqno)
-        with self._early_recv_lock:
-            self._early_recv_consumed.add(key)
-            future = self._early_recv_futures.get(key)
-            if future is None:
-                # The hint was still queued while slots were full: this batch is dispatched, so post it now
-                hint = self._early_recv_pending.pop(key, None)
-                if hint is not None:
-                    future = lwd_get_data_plane().submit_recv(
-                        self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows)
-                    )
-                    self._early_recv_futures[key] = future
-            if future is not None:
-                if key in self._early_recv_reported:
-                    # Completion already reported: consumption is the entry's end (the reporter will not touch it again)
-                    self._early_recv_futures.pop(key, None)
-                    self._early_recv_reported.discard(key)
-                    self._early_recv_consumed.discard(key)
-            else:
-                # The hint truly never arrived (or lands later than this
-                # SO): re-post from the same information so the report chain
-                # has no gaps and the watermark can keep advancing
-                lwd_logger.info("[Lwd][pre-recv] submit at consume seqno=%d", seqno)
-                future = lwd_get_data_plane().submit_recv(self._lwd_build_up_recv_request(seqno, num_tokens, aux_rows))
-                self._early_recv_futures[key] = future
-            inflight = len(self._early_recv_futures)
-            queued = len(self._early_recv_pending)
-        # Slot returned: post the next queued hint
-        self._early_recv_pump()
-        lwd_logger.info(
-            "[Lwd][pre-recv] stats seqno=%d inflight=%d queued=%d",
-            seqno,
-            inflight,
-            queued,
-        )
-        return future
-
-    # Note: take_lwd_up_embeds (host-blocking harvest) is not revived with
-    # the port — UP consumption lives in the runner on this line
-    # (_lwd_inject_remote_embeds: endpoint gate + in-place TP broadcast);
-    # the worker layer keeps only the post side. aux (mrope) frames are
-    # consumed on the same path.
+                # Publish-then-pop (even on D2H failure: the recv WAS
+                # delivered, re-posting it would misalign the channel)
+                self._early_recv_futures.pop(key, None)
+                self._early_recv_row_tables.pop(key, None)
+                if key[1] > self._early_recv_last_delivered:
+                    self._early_recv_last_delivered = key[1]
+            self._early_recv_pump()
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -851,7 +735,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
         The provider resolves the request's prompt embeds from the
         runner's ``input_batch.req_prompt_embeds`` (already injected by
-        ``_lwd_inject_remote_embeds`` during prefill); a missing entry
+        ``_lwd_inject_from_stager`` during prefill); a missing entry
         (not scheduled / not LWD) returns None and the proposer falls
         back to the token-id path.
         """
