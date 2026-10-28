@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 
     from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_worker import LwdCloudWorker
     from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
+from vllm_ascend.worker.lwd_cloud_model.lwd_draft_cache import LwdDraftCache
 
 
 class LwdDownSelection(NamedTuple):
@@ -91,6 +92,22 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self.lwd_hash_state = None
         # None marks "no real batch staged yet"; distinguishes dummy forwards.
         self._lwd_hash_step_tokens = None
+        # Spec-decode draft snapshots for requests temporarily absent
+        # from the batch (async scheduling + MTP only): the graph input
+        # buffers are reused every step, so a departing request's draft
+        # rows must survive in owned storage until it returns.
+        self._lwd_draft_cache = (
+            LwdDraftCache()
+            if self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            # This lineage's runner has no pcp_size attribute: the PCP
+            # width comes from the parallel config (as the DSV4 check
+            # above reads it); dcp_size is a real base-runner attribute.
+            and vllm_config.parallel_config.prefill_context_parallel_size == 1
+            and self.dcp_size == 1
+            else None
+        )
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
         if num_hash_layers and vllm_config.lwd_config is not None:
@@ -206,6 +223,64 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # embeddings arrive over the UP channel and must drive forward)        #
     # ------------------------------------------------------------------ #
 
+    def _prepare_input_ids(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        super()._prepare_input_ids(
+            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens,
+        )
+        self._lwd_restore_drafts(scheduler_output, num_reqs, cu_num_tokens)
+
+    def _lwd_restore_drafts(
+        self,
+        scheduler_output: SchedulerOutput,
+        num_reqs: int,
+        cu_num_tokens: np.ndarray,
+    ) -> None:
+        """Reinstate a returning request's draft rows into input_ids.
+
+        A request absent for a few steps (paused/queued under async
+        scheduling) returns with its scheduled spec-decode segment; the
+        native fill wrote prompt/decode ids, the draft rows at the
+        segment tail come back from the preserved snapshot (device
+        scatter, same stream as the native input assembly - no D2H, no
+        host wait).
+        """
+        cache = self._lwd_draft_cache
+        if cache is None or not cache.entries:
+            return
+        rows, indices = [], []
+        for idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            if req_id not in cache.entries:
+                continue
+            tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
+            row = cache.take(req_id, self.requests[req_id], len(tokens))
+            # Consume the generation even when the scheduler dropped all
+            # drafts (the snapshot must not leak into a later return).
+            if not tokens or self.prev_positions.np[idx] >= 0:
+                continue
+            if row is None:
+                raise RuntimeError(f"LWD draft snapshot is invalid for {req_id}")
+            end = int(cu_num_tokens[idx])
+            begin = int(cu_num_tokens[idx - 1]) if idx else 0
+            if end - begin < len(tokens) + 1:
+                raise RuntimeError(f"LWD draft segment is too short for {req_id}")
+            rows.append(row)
+            indices.extend(range(end - len(tokens), end))
+        if rows:
+            dst = torch.tensor(
+                indices, dtype=torch.int64, pin_memory=self.pin_memory
+            ).to(self.device, non_blocking=True)
+            self.input_ids.gpu.scatter_(
+                0,
+                dst,
+                torch.cat(rows).to(dtype=self.input_ids.gpu.dtype),
+            )
+
     def _prepare_inputs(
         self,
         scheduler_output: SchedulerOutput,
@@ -229,6 +304,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         written straight into the inputs_embeds.gpu scheduling window
         of the current step (last write wins).
         """
+        # Wire v3: new requests' full-prompt mrope positions ride their
+        # NewRequestData (relayed from the RequestNotify payload by the
+        # scheduler); prime req_state once at the request's first
+        # scheduled step - before super(), so the current step's
+        # _calc_mrope_positions already reads the primed rows.
+        for d in scheduler_output.scheduled_new_reqs:
+            payload = getattr(d, "lwd_mrope_positions", b"") or b""
+            if payload:
+                self._lwd_prime_mrope_positions(d.req_id, payload)
         # H2D staging + TP broadcast before super(): the side-stream
         # copies overlap with super()'s host-side work; the compute
         # stream only waits on the ready event recorded after the last
@@ -369,6 +453,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable[[], None] | None:
         self._lwd_rewind_staged_reads(scheduler_output)
+        if self._lwd_draft_cache is not None:
+            # Snapshot departing requests' draft rows before the batch
+            # mapping changes (same stream as the input prep).
+            self._lwd_draft_cache.preserve(
+                scheduler_output,
+                self.requests,
+                self.input_batch.prev_req_id_to_index,
+                self._draft_token_ids,
+            )
         """LWD: materialize meta placeholder embeds in place before they
         reach the base (zero base seams).
 
@@ -697,6 +790,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         bufs = getattr(self, "_lwd_win_dev", None)
         if bufs is None or bufs[0].numel() < numel:
             hidden = self.model_config.get_hidden_size()
+            num_hash_layers, top_k = self._lwd_hash_dims()
+            per_row = hidden + 4 * num_hash_layers * top_k
             max_tokens = int(
                 getattr(
                     getattr(self.vllm_config, "scheduler_config", None),
@@ -705,7 +800,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 )
                 or 0
             )
-            cap = max(numel, hidden * max_tokens)
+            cap = max(numel, per_row * max_tokens)
             bufs = [
                 torch.empty(max(cap, numel), dtype=torch.bfloat16, device=self.device)
                 for _ in range(2)
@@ -742,8 +837,19 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         worker = self.worker
         is_endpoint = bool(worker is not None and worker._lwd_early_recv_endpoint)
         hidden_size = self.model_config.get_hidden_size()
+        # DSV4 expert-ID tail (4 * hash_layers * top_k bf16 elements per
+        # row): rides the SAME window after the embeds region and
+        # broadcasts with it - a non-endpoint rank holds no host stager,
+        # so the broadcast is its only source of expert IDs.
+        num_hash_layers, top_k = self._lwd_hash_dims()
+        per_row_tail = 4 * num_hash_layers * top_k
+        # Per-request tail-slice base: the read pointer BEFORE this
+        # step's advance (slicing with the post-advance `consumed` would
+        # read the NEXT window's tail rows).
+        self._lwd_step_tail_base: dict[str, int] = {}
         total_rows = sum(w for _i, _rid, _ncomp, w in plan)
         embed_numel = total_rows * hidden_size
+        window_numel = embed_numel + total_rows * per_row_tail
         if is_endpoint:
             stager = getattr(worker, "_lwd_stager", None)
             if stager is None:
@@ -754,7 +860,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     "[Lwd][cloud-runner] endpoint rank without host stager "
                     "(host staging is mandatory in this deployment)"
                 )
-            dev, win_idx = self._lwd_window_device(embed_numel)
+            dev, win_idx = self._lwd_window_device(window_numel)
             stream = self._lwd_h2d_stream()
             used_ev = self._lwd_win_used_ev[win_idx]
             with torch.npu.stream(stream):
@@ -763,11 +869,27 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     # broadcast) of this buffer before overwriting it.
                     stream.wait_event(used_ev)
                 offset = 0
+                tail_offset = 0
                 for _i, rid, ncomp, w in plan:
                     self._lwd_stage_one_request(
                         stager, rid, ncomp, w, dev, offset
                     )
                     offset += w * hidden_size
+                    if per_row_tail:
+                        req = stager.take_req(rid)
+                        assert req is not None
+                        t_start, _t_end = req.tail_range_at(
+                            self._lwd_step_tail_base[rid], w
+                        )
+                        n = w * per_row_tail
+                        dev[
+                            embed_numel + tail_offset:
+                            embed_numel + tail_offset + n
+                        ].copy_(
+                            req.host[t_start : t_start + n],
+                            non_blocking=True,
+                        )
+                        tail_offset += n
                 ready_ev = torch.npu.Event()
                 ready_ev.record(stream)
             # Order the compute stream after the copies before the
@@ -785,7 +907,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         else:
             # Receive side of the broadcast: same row total as the
             # endpoint (W4), plain allocation - no host stager locally.
-            dev = torch.empty(embed_numel, dtype=torch.bfloat16, device=self.device)
+            dev = torch.empty(window_numel, dtype=torch.bfloat16, device=self.device)
             win_idx = None
         tp = get_tp_group()
         if tp.world_size > 1:
@@ -828,10 +950,73 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 f"{ncomp} (rows={w}); the embeddings would be injected "
                 f"at a position that does not match the data read"
             )
+        # Tail-slice base for this step: the PRE-advance read pointer
+        # (the harvest slices the expert-ID tail after the embeds but
+        # must not observe the pointer this call's consumer advances).
+        self._lwd_step_tail_base[rid] = consumed
         host_start, numel, _tail = stager.segment_for(rid, w)
         buf[elem_offset : elem_offset + numel].copy_(
             stager.take_req(rid).host[host_start : host_start + numel],
             non_blocking=True,
+        )
+
+    @staticmethod
+    def _lwd_decode_expert_ids(
+        seg: torch.Tensor, w: int, num_layers: int, top_k: int
+    ) -> torch.Tensor:
+        """Decode the window's expert-ID byte region into ``[w, L, K]``
+        int32.
+
+        Same VALUE conversion as ``unpack_hash_payload``: the wire order
+        stores one byte value (0-255, exactly representable in bf16) per
+        bf16 element, so cast ``.to(torch.uint8)`` first and re-view as
+        int32. NEVER ``.view(torch.uint8)`` - that reinterprets the bf16
+        bit pattern as two bytes (wrong values, doubled element count)
+        and the downstream reshape would explode.
+        """
+        return (
+            seg.contiguous()
+            .to(torch.uint8)
+            .view(torch.int32)
+            .view(w, num_layers, top_k)
+        )
+
+    def _lwd_prime_mrope_positions(self, req_id: str, payload: bytes) -> None:
+        """Prime req_state's full-prompt mrope positions (wire v3).
+
+        The positions arrive once with the RequestNotify ([3, prompt_len]
+        int64 raw bytes, computed by the edge at admission); frombuffer
+        writes them with zero transposition and the delta is derived in
+        place (= positions.max()+1-prompt_len, value-identical to the
+        edge side) for the native _calc_mrope_positions to compute the
+        completion-segment positions during decode.
+
+        req_state.mrope_positions starts as the ids=None arange
+        passthrough (text-only positions); multimodal requests overwrite
+        it here, text-only requests never carry a payload.
+        """
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] mrope prime req={req_id}: req_state "
+                f"not found (admission ordering broken)"
+            )
+        plen = int(req_state.num_prompt_tokens)
+        positions = torch.frombuffer(bytearray(payload), dtype=torch.int64)
+        if positions.numel() != 3 * plen:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] mrope prime req={req_id}: payload "
+                f"{positions.numel()} elems != 3 * prompt_len {plen} "
+                f"(edge/cloud version mismatch; deploy matching versions)"
+            )
+        positions = positions.view(3, plen)
+        req_state.mrope_positions[:, :plen] = positions
+        req_state.mrope_position_delta = int(positions.max().item()) + 1 - plen
+        lwd_logger.info(
+            "[Lwd][cloud-runner] mrope primed req=%s prompt=%d delta=%d",
+            req_id,
+            plen,
+            req_state.mrope_position_delta,
         )
 
     def _lwd_inject_from_stager(
@@ -852,19 +1037,53 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if dev is None:
             return
         hidden_size = self.model_config.get_hidden_size()
-        embeds = dev.view(-1, hidden_size)
+        num_hash_layers, top_k = self._lwd_hash_dims()
+        per_row_tail = 4 * num_hash_layers * top_k
         gpu_embeds = self.inputs_embeds.gpu
-        planned = {i: w for i, _rid, _ncomp, w in self._lwd_prefill_windows(num_scheduled_tokens)}
+        num_prompt = self.input_batch.num_prompt_tokens
+        num_computed = self.input_batch.num_computed_tokens_cpu
+        planned = {
+            i: (rid, w)
+            for i, rid, _ncomp, w in self._lwd_prefill_windows(num_scheduled_tokens)
+        }
+        # The window's first total_rows*H elements are the embeds; the
+        # expert-ID tail region follows immediately in the same row
+        # order as the plan (the broadcast layout is the authority).
+        n_reqs = min(len(self.input_batch.req_ids), len(num_scheduled_tokens))
+        total_rows = 0
+        for i in range(n_reqs):
+            entry = planned.get(i)
+            if entry is None:
+                continue
+            ncomp = int(num_computed[i])
+            nprog = int(num_prompt[i])
+            if ncomp < nprog:
+                total_rows += min(entry[1], nprog - ncomp)
+        embed_numel = total_rows * hidden_size
+        embeds = dev[:embed_numel].view(-1, hidden_size)
         row = 0
         flat = 0
-        n_reqs = min(len(self.input_batch.req_ids), len(num_scheduled_tokens))
         for i in range(n_reqs):
             n = int(num_scheduled_tokens[i])
-            w = planned.get(i, 0)
+            entry = planned.get(i)
+            w = entry[1] if entry is not None else 0
             if w > 0:
+                assert entry is not None
+                rid = entry[0]
                 gpu_embeds[flat : flat + w].copy_(
                     embeds[row : row + w], non_blocking=True
                 )
+                if self.lwd_hash_state is not None and per_row_tail:
+                    ncomp = int(num_computed[i])
+                    nprog = int(num_prompt[i])
+                    seg = dev[
+                        embed_numel + row * per_row_tail:
+                        embed_numel + (row + w) * per_row_tail
+                    ]
+                    ids = self._lwd_decode_expert_ids(
+                        seg, w, num_hash_layers, top_k
+                    )
+                    self.lwd_hash_state.add_chunk(rid, nprog, ncomp, ids)
                 row += w
             flat += n
         # Window lifecycle: the double-buffered slot's used event gates
