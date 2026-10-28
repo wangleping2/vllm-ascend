@@ -78,6 +78,25 @@ env_variables: dict[str, Callable[[], Any]] = {
     "DYNAMIC_EPLB": lambda: os.getenv("DYNAMIC_EPLB", "false").lower(),
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
+    # LWD host staging (docs/design/lwd_host_staging.md): 1 (default -
+    # this lineage's only cloud scheduling mode) makes the endpoint
+    # worker stage received embeddings in per-request pinned host
+    # buffers and report arrival rows; 0 leaves the arrival ledger empty
+    # and the visible-set scheduler deadlocks silently (the engine
+    # fail-fasts at startup for that combination).
+    "VLLM_ASCEND_LWD_HOST_STAGE": lambda: _strict_binary_env(
+        "VLLM_ASCEND_LWD_HOST_STAGE", "1"
+    ),
+    # Device ping-pong slot count override for the host stager
+    # (0 = derive from the in-flight recv cap).
+    "VLLM_ASCEND_LWD_HOST_STAGE_SLOTS": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_HOST_STAGE_SLOTS") or 0
+    ),
+    # Posted-but-not-published UP recvs before hints queue on the cloud
+    # endpoint (must stay >= the edge's pending-chunks gate).
+    "VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV": lambda: int(
+        os.getenv("VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV") or 8
+    ),
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.

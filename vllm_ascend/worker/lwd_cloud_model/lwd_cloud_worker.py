@@ -14,7 +14,6 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from dataclasses import replace
@@ -22,6 +21,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from vllm.lwd_logger import lwd_logger
+
+from vllm_ascend import envs
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
 # ops must initialize before the model_runner chain, otherwise device_op
@@ -63,13 +64,11 @@ _LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
 _LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
 _LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 
-# Posted-but-not-published recvs before hints queue (env-tunable). Must
-# stay >= the edge's pending-chunks gate (3) so the cloud can always post
-# whatever the edge may still have in flight; larger values only hold
-# more device-slot memory.
-_LWD_EARLY_RECV_MAX_INFLIGHT = int(
-    os.environ.get("VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV", "8")
-)
+# Posted-but-not-published recvs before hints queue (see
+# VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV in envs.py). Must stay >= the edge's
+# pending-chunks gate so the cloud can always post whatever the edge may
+# still have in flight; larger values only hold more device-slot memory.
+_LWD_EARLY_RECV_MAX_INFLIGHT = envs.VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV
 
 
 class LwdCloudWorker(LwdWorkerBase):
@@ -134,13 +133,22 @@ class LwdCloudWorker(LwdWorkerBase):
         this pool publishes: without the stager the ledger stays at 0,
         the visible-set predicate rejects every prefill request and the
         whole system deadlocks silently - scheduling and reporting are
-        two halves of the same feature and must both be present.
+        two halves of the same feature and must both be present. The
+        engine fail-fasts at startup when the switch is off; this gate
+        exists for the same-script A/B comparison.
 
         Slot sizing uses the hash payload formula (embeds + optional
         expert-ID tail): the UP recv numel is hash_payload_numel
         (_lwd_build_up_recv_request); sizing by hidden alone makes the
         allocate geometry check reject every DSV4 batch.
         """
+        if not envs.VLLM_ASCEND_LWD_HOST_STAGE:
+            lwd_logger.warning(
+                "[Lwd][host-stage] disabled by env on the endpoint rank; "
+                "the arrival ledger will stay empty (the engine's startup "
+                "check rejects this combination)"
+            )
+            return
 
         def _pinned(n: int) -> torch.Tensor:
             return torch.empty(n, dtype=torch.bfloat16, device="cpu").pin_memory()
@@ -155,16 +163,20 @@ class LwdCloudWorker(LwdWorkerBase):
             hash_layer_count(_cfg),
             int(getattr(_cfg, "num_experts_per_tok", 0) or 0),
         )
+        slots = (
+            envs.VLLM_ASCEND_LWD_HOST_STAGE_SLOTS
+            or self._early_recv_max_inflight
+        )
         self._lwd_stager = LwdHostStager(
             device="cpu",
-            slots=self._early_recv_max_inflight,
+            slots=slots,
             empty_factory=_pinned,
             max_numel=_max_numel or None,
         )
         lwd_logger.info(
             "[Lwd][host-stage] stager ready slots=%d max_numel=%d "
             "(max_tokens=%d hidden=%d, no host cap)",
-            self._early_recv_max_inflight,
+            slots,
             _max_numel,
             _max_tok,
             hidden_size,
