@@ -137,6 +137,13 @@ class LwdCloudWorker(LwdWorkerBase):
         engine fail-fasts at startup when the switch is off; this gate
         exists for the same-script A/B comparison.
 
+        The ping-pong slot buffers (``device=``) MUST live on the NPU:
+        the receive lands directly into a slot view (HCCL requires a
+        device tensor - a CPU slot raises "No backend type associated
+        with device type cpu" inside dist.irecv and kills the comm
+        thread). The per-request HOST buffers are pinned by the stager's
+        own default factory.
+
         Slot sizing uses the hash payload formula (embeds + optional
         expert-ID tail): the UP recv numel is hash_payload_numel
         (_lwd_build_up_recv_request); sizing by hidden alone makes the
@@ -149,9 +156,6 @@ class LwdCloudWorker(LwdWorkerBase):
                 "check rejects this combination)"
             )
             return
-
-        def _pinned(n: int) -> torch.Tensor:
-            return torch.empty(n, dtype=torch.bfloat16, device="cpu").pin_memory()
 
         _cfg = self.model_config.hf_config
         _max_tok = (
@@ -168,9 +172,8 @@ class LwdCloudWorker(LwdWorkerBase):
             or self._early_recv_max_inflight
         )
         self._lwd_stager = LwdHostStager(
-            device="cpu",
+            device=self.device,
             slots=slots,
-            empty_factory=_pinned,
             max_numel=_max_numel or None,
         )
         lwd_logger.info(
